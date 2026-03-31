@@ -1,18 +1,18 @@
 """
 Charge-dependent model Phase 3 (E) for BAM-torch.
 
-Phase 3 설계 원칙 — "CEP as Pure Charge Predictor":
-  - E_total = E_SR only  (U_CENT 에너지 기여 제거)
-  - CEP block: hard charge conservation 유지 (Lagrange 해석해)
-  - charge_type agnostic: NPA / Mulliken / Hirshfeld 모두 수용
-  - Physical mismatch 해결: QEq 에너지 가정 없이 전하만 예측
+Phase 3 design principle — "CEP as Pure Charge Predictor":
+  - E_total = E_SR only (U_CENT energy contribution removed)
+  - CEP block: hard charge conservation maintained (Lagrange analytical solution)
+  - charge_type agnostic: accepts NPA / Mulliken / Hirshfeld
+  - Resolves physical mismatch: predicts charges without QEq energy assumptions
 
-Phase 2 (CENT2) 와의 차이:
-  - E_total = E_SR (U_CENT 항 제거)
-  - use_cent_energy 파라미터로 전환 가능 (True 시 Phase 2 동작)
-  - charge_type 파라미터 추가 (데이터 레이블용)
+Differences from Phase 2 (CENT2):
+  - E_total = E_SR (U_CENT term removed)
+  - use_cent_energy parameter for toggling (True reverts to Phase 2 behavior)
+  - charge_type parameter added (for data labeling)
 
-참고:
+Reference:
   Khajehpasha et al., Phys. Rev. B 105, 144106 (2022) — CENT2
 """
 
@@ -46,22 +46,22 @@ from bam_torch.charge_dependent.model.cep_block import CEPBlock
 @compile_mode("script")
 class ChargeRACEv3(torch.nn.Module):
     """
-    Phase 3 (E) Charge-dependent RACE 모델 — CEP as Pure Charge Predictor.
+    Phase 3 (E) Charge-dependent RACE model — CEP as Pure Charge Predictor.
 
-    총 에너지 분해:
-        E_total = E_SR (RACE 단거리)   ← U_CENT 제거 (Phase 3 핵심)
+    Total energy decomposition:
+        E_total = E_SR (RACE short-range)   <- U_CENT removed (Phase 3 core change)
 
-    CEP Block (charge predictor 역할만 수행):
-        χ_i  = MLP(scalar node features)      ← 환경 의존 전기음성도
-        J_i  = softplus(J_raw[species])        ← 원소별 경도 (학습)
-        q_i  = (λ - χ_i) / J_i                ← Lagrange 해석해
-        (U_CENT 는 계산되지만 E_total 에 포함되지 않음)
+    CEP Block (charge predictor role only):
+        chi_i = MLP(scalar node features)      <- environment-dependent electronegativity
+        J_i   = softplus(J_raw[species])        <- per-element hardness (learnable)
+        q_i   = (lambda - chi_i) / J_i          <- Lagrange analytical solution
+        (U_CENT is computed but not included in E_total)
 
     Args:
-        charge_type    : 전하 타입 레이블 ('npa', 'mulliken', 'hirshfeld')
-        use_cent_energy: True 이면 E_total += U_CENT (Phase 2 동작, 기본 False)
-        cep_hidden_dim : CEP χ_i MLP hidden dimension (기본 64)
-        나머지 인자는 기존 RACE/ChargeRACE 와 동일.
+        charge_type    : charge type label ('npa', 'mulliken', 'hirshfeld')
+        use_cent_energy: if True, E_total += U_CENT (Phase 2 behavior, default False)
+        cep_hidden_dim : CEP chi_i MLP hidden dimension (default 64)
+        Other args are identical to the base RACE/ChargeRACE model.
     """
 
     def __init__(
@@ -82,7 +82,7 @@ class ChargeRACEv3(torch.nn.Module):
         cueq_config: Optional[Dict[str, Any]] = None,
         regress_forces: str = "direct",
         compute_stress: bool = True,
-        # Phase 3 파라미터
+        # Phase 3 parameters
         cep_hidden_dim: int = 64,
         use_cent_energy: bool = False,
         charge_type: str = "npa",
@@ -105,11 +105,11 @@ class ChargeRACEv3(torch.nn.Module):
         self.hidden_irreps = hidden_irreps
         self.nlayers = nlayers
 
-        # Phase 3 속성
+        # Phase 3 attributes
         self.use_cent_energy: bool = use_cent_energy
         self.charge_type: str = charge_type
 
-        # Criterion 관련 (RACE 호환성 유지)
+        # Criterion (RACE compatibility)
         self.criterion = None
         self.criterion_tag = None
         self.criterion_value = 0
@@ -301,7 +301,7 @@ class ChargeRACEv3(torch.nn.Module):
             node_feats_list.append(node_feats)
             outputs.append(node_energies[:, 0])
 
-        # ── E_SR: 단거리 에너지 합산 ──────────────────────────────────────
+        # ── E_SR: short-range energy summation ────────────────────────────
         node_energy = torch.stack(outputs, dim=-1)
         node_energy = self.act_fn(node_energy)
         node_energy = torch.sum(node_energy, dim=-1)
@@ -313,7 +313,7 @@ class ChargeRACEv3(torch.nn.Module):
             dim_size=num_graphs,
         )
 
-        # ── CEP: 전하 결정 (Phase 3: 에너지에 포함하지 않음) ──────────────
+        # ── CEP: charge determination (Phase 3: not included in energy) ──
         last_node_feats = node_feats_list[-1]
 
         if "total_charge" in data:
@@ -331,9 +331,9 @@ class ChargeRACEv3(torch.nn.Module):
             num_graphs=num_graphs,
         )
 
-        # ── E_total 결정 ──────────────────────────────────────────────────
-        # Phase 3 (E): E_total = E_SR  (U_CENT 기여 제거)
-        # use_cent_energy=True 이면 Phase 2 동작 (하위 호환)
+        # ── E_total determination ─────────────────────────────────────────
+        # Phase 3 (E): E_total = E_SR (U_CENT contribution removed)
+        # use_cent_energy=True reverts to Phase 2 behavior (backward compat)
         if self.use_cent_energy:
             graph_energy = E_SR + cep_out["U_CENT"]
         else:

@@ -1,9 +1,9 @@
 """
-Charge-dependent model 평가기 Phase 2.
+Charge-dependent model evaluator Phase 2.
 
-Phase 2 변경:
-  - charge_mode 체크 제거 (CEP 항상 활성화 → 항상 charge 수집)
-  - chi (전기음성도), U_CENT 도 test_values 에 추가 수집
+Phase 2 changes:
+  - charge_mode check removed (CEP always active -> always collect charges)
+  - chi (electronegativity), U_CENT also collected in test_values
 """
 
 import torch
@@ -25,12 +25,12 @@ from bam_torch.utils.utils import date, on_exit
 
 class CDEvaluator(CDTrainer):
     """
-    Phase 2 Charge-dependent model 평가기.
+    Phase 2 Charge-dependent model evaluator.
 
-    CDTrainer 를 상속하며 평가 시:
-      - energy, forces 예측 정확도 평가
-      - CEP atomic charges (q_i) 예측 정확도 평가
-      - chi (전기음성도), U_CENT 수집
+    Inherits CDTrainer and evaluates:
+      - energy, forces prediction accuracy
+      - CEP atomic charges (q_i) prediction accuracy
+      - chi (electronegativity), U_CENT collection
     """
 
     def __init__(self, json_data, rank=0, world_size=1):
@@ -48,7 +48,7 @@ class CDEvaluator(CDTrainer):
         super().__init__(self.json_data, self.rank, self.world_size)
 
     def setup(self):
-        """평가에 필요한 컴포넌트 구성"""
+        """Configure components required for evaluation."""
         self.set_random_seed()
         self.device = self.configure_device()
         self.model, self.n_params, self.model_ckpt, self.start_epoch = \
@@ -62,9 +62,9 @@ class CDEvaluator(CDTrainer):
 
     def evaluate(self, element_wise=True):
         """
-        모델 평가 수행.
+        Run model evaluation.
 
-        Phase 2: CEP 가 항상 활성화이므로 charge 는 항상 수집.
+        Phase 2: CEP is always active, so charges are always collected.
         """
         self.logger.print_logger_head()
         eval_loss_dict = {
@@ -78,7 +78,7 @@ class CDEvaluator(CDTrainer):
             'force_x': [], 'force_y': [], 'force_z': [],
             'exact_energy': [],
             'exact_force_x': [], 'exact_force_y': [], 'exact_force_z': [],
-            # CEP 결과
+            # CEP results
             'atomic_charges': [],
             'exact_atomic_charges': [],
             'total_charge': [],
@@ -117,7 +117,7 @@ class CDEvaluator(CDTrainer):
             test_values['exact_force_y'].append(data['forces'][:, 1].detach().cpu())
             test_values['exact_force_z'].append(data['forces'][:, 2].detach().cpu())
 
-            # ── CEP 결과 수집 ─────────────────────────────────────────────
+            # ── CEP results collection ────────────────────────────────────
             if "atomic_charges" in preds:
                 test_values['atomic_charges'].append(
                     preds['atomic_charges'].detach().cpu()
@@ -160,7 +160,7 @@ class CDEvaluator(CDTrainer):
             if i % 100 == 0:
                 gc.collect()
 
-        # ── 결과 요약 출력 ─────────────────────────────────────────────────
+        # ── Results summary ───────────────────────────────────────────────
         eval_loss_dict = {
             key: torch.mean(torch.tensor(value))
             for key, value in eval_loss_dict.items()
@@ -181,7 +181,7 @@ class CDEvaluator(CDTrainer):
         print(f"\n\033[32mPrediction values saved to test_values.pkl\033[0m")
 
     def get_scale_shift_correction(self, element_wise):
-        """학습 시 저장된 scale-shift 보정값 로드"""
+        """Load scale-shift correction values saved during training."""
         if element_wise:
             try:
                 e_corr = torch.tensor(
@@ -205,7 +205,7 @@ class CDEvaluator(CDTrainer):
         return e_corr, element_wise
 
     def configure_dataloader(self):
-        """평가용 DataLoader 구성 (charge 포함)"""
+        """Configure evaluation DataLoader (with charge data)."""
         jd = self.json_data
         charge_config = jd.get('charge', {})
         charge_key       = charge_config.get('charge_key', 'charges')

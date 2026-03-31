@@ -1,18 +1,18 @@
 """
 Charge-dependent model Phase 2 for BAM-torch.
 
-CENT2 기반 CEP (Charge Equilibration Process) 방식:
-  - χ_i = MLP(node_feats): 환경 의존 전기음성도 (ANN 예측)
-  - J_i = softplus(J_raw[species]): 원소별 화학적 경도 (학습 파라미터)
-  - CEP 해석해: Lagrange 승수법으로 hard charge conservation 보장
-  - E_total = E_SR (RACE 단거리) + U_CENT (CEP 정전기 에너지)
+CENT2-based CEP (Charge Equilibration Process):
+  - chi_i = MLP(node_feats): environment-dependent electronegativity (ANN-predicted)
+  - J_i = softplus(J_raw[species]): per-element chemical hardness (learnable parameter)
+  - CEP analytical solution: Lagrange multiplier for hard charge conservation
+  - E_total = E_SR (RACE short-range) + U_CENT (CEP electrostatic energy)
 
-Phase 1 (MLP Readout, soft conservation) 과의 차이:
-  - 전하 보존이 수학적으로 항상 보장 (hard constraint)
-  - 전하가 총 에너지에 기여 (U_CENT 항 추가)
-  - charge_mode 파라미터 제거 (CEP가 항상 활성화)
+Differences from Phase 1 (MLP Readout, soft conservation):
+  - Charge conservation is mathematically guaranteed (hard constraint)
+  - Charges contribute to total energy (U_CENT term added)
+  - charge_mode parameter removed (CEP always active)
 
-참고:
+Reference:
   Khajehpasha et al., Phys. Rev. B 105, 144106 (2022) — CENT2
 """
 
@@ -48,20 +48,20 @@ from bam_torch.charge_dependent.model.cep_block import CEPBlock
 @compile_mode("script")
 class ChargeRACE(torch.nn.Module):
     """
-    Phase 2 Charge-dependent RACE 모델 (CENT2 기반 CEP).
+    Phase 2 Charge-dependent RACE model (CENT2-based CEP).
 
-    총 에너지 분해:
-        E_total = E_SR (RACE 단거리) + U_CENT (CEP 정전기)
+    Total energy decomposition:
+        E_total = E_SR (RACE short-range) + U_CENT (CEP electrostatic)
 
     CEP Block:
-        χ_i  = MLP(scalar node features)      ← 환경 의존 전기음성도
-        J_i  = softplus(J_raw[species])        ← 원소별 경도 (학습)
-        q_i  = (λ - χ_i) / J_i                ← Lagrange 해석해
-        U_CENT = Σ_i [χ_i q_i + ½ J_i q_i²]  ← CEP 에너지
+        chi_i = MLP(scalar node features)      <- environment-dependent electronegativity
+        J_i   = softplus(J_raw[species])        <- per-element hardness (learnable)
+        q_i   = (lambda - chi_i) / J_i          <- Lagrange analytical solution
+        U_CENT = sum_i [chi_i q_i + 0.5 J_i q_i^2]  <- CEP energy
 
     Args:
-        cep_hidden_dim : CEP χ_i MLP hidden dimension (기본 64)
-        나머지 인자는 기존 RACE 와 동일.
+        cep_hidden_dim : CEP chi_i MLP hidden dimension (default 64)
+        Other args are identical to the base RACE model.
     """
 
     def __init__(
@@ -82,7 +82,7 @@ class ChargeRACE(torch.nn.Module):
         cueq_config: Optional[Dict[str, Any]] = None,
         regress_forces: str = "direct",
         compute_stress: bool = True,
-        # CEP 파라미터
+        # CEP parameters
         cep_hidden_dim: int = 64,
     ):
         super().__init__()
@@ -103,7 +103,7 @@ class ChargeRACE(torch.nn.Module):
         self.hidden_irreps = hidden_irreps
         self.nlayers = nlayers
 
-        # Criterion 관련 (RACE 호환성 유지)
+        # Criterion (RACE compatibility)
         self.criterion = None
         self.criterion_tag = None
         self.criterion_value = 0
@@ -295,7 +295,7 @@ class ChargeRACE(torch.nn.Module):
             node_feats_list.append(node_feats)
             outputs.append(node_energies[:, 0])
 
-        # ── E_SR: 단거리 에너지 합산 ──────────────────────────────────────
+        # ── E_SR: short-range energy summation ────────────────────────────
         node_energy = torch.stack(outputs, dim=-1)
         node_energy = self.act_fn(node_energy)
         node_energy = torch.sum(node_energy, dim=-1)
@@ -307,10 +307,10 @@ class ChargeRACE(torch.nn.Module):
             dim_size=num_graphs,
         )
 
-        # ── CEP: 전하 결정 + U_CENT 계산 ──────────────────────────────────
+        # ── CEP: charge determination + U_CENT calculation ───────────────
         last_node_feats = node_feats_list[-1]
 
-        # total_charge 없으면 0 으로 대체
+        # Default to 0 if total_charge not provided
         if "total_charge" in data:
             total_charge = data["total_charge"].float()
         else:

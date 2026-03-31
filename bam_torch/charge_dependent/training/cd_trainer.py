@@ -1,13 +1,13 @@
 """
 Charge-dependent trainer Phase 2 for BAM-torch.
 
-CENT2 기반 CEP 모델 (ChargeRACE Phase 2) 학습 지원.
+Training support for CENT2-based CEP model (ChargeRACE Phase 2).
 
-Phase 1 과의 차이:
-  - charge_mode 파라미터 제거 (CEP 항상 활성화)
-  - chg_cons_lambda 제거 (hard conservation 으로 불필요)
-  - cep_hidden_dim 파라미터 추가
-  - compute_loss: loss_q 만 유지 (loss_q_cons 제거)
+Differences from Phase 1:
+  - charge_mode parameter removed (CEP always active)
+  - chg_cons_lambda removed (unnecessary with hard conservation)
+  - cep_hidden_dim parameter added
+  - compute_loss: only loss_q retained (loss_q_cons removed)
 """
 
 import torch
@@ -22,24 +22,24 @@ from bam_torch.charge_dependent.utils.cd_utils import get_dataloader_charge
 
 class CDTrainer(BaseTrainer):
     """
-    Phase 2 Charge-dependent 모델 학습 Trainer.
+    Phase 2 Charge-dependent model Trainer.
 
-    BaseTrainer 를 상속하며 다음을 오버라이드:
-      - set_model()           : ChargeRACE (Phase 2, CEP) 모델 생성
-      - configure_dataloader(): charge 정보 포함 DataLoader
-      - compute_loss()        : energy/force loss + charge loss (CEP 기반)
+    Inherits BaseTrainer and overrides:
+      - set_model()           : creates ChargeRACE (Phase 2, CEP) model
+      - configure_dataloader(): DataLoader with charge information
+      - compute_loss()        : energy/force loss + charge loss (CEP-based)
 
-    Loss 구성:
-      total_loss = enr_lambda  × loss_E
-                 + frc_lambda  × loss_F
-                 + chg_lambda  × loss_Q   (q_pred vs NPA charges)
+    Loss composition:
+      total_loss = enr_lambda  * loss_E
+                 + frc_lambda  * loss_F
+                 + chg_lambda  * loss_Q   (q_pred vs NPA charges)
     """
 
     def __init__(self, json_data, rank=0, world_size=1):
         super().__init__(json_data, rank, world_size)
 
     def set_model(self):
-        """ChargeRACE Phase 2 (CEP) 모델 구성"""
+        """Configure ChargeRACE Phase 2 (CEP) model."""
         mc = self.json_data
 
         cutoff            = mc.get('cutoff', 6.0)
@@ -59,11 +59,11 @@ class CDTrainer(BaseTrainer):
         elif regress_forces is False:
             regress_forces = "false"
 
-        # CEP 설정
+        # CEP config
         charge_config = mc.get('charge', {})
         cep_hidden_dim = charge_config.get('cep_hidden_dim', 64)
 
-        # CuEquivariance 설정
+        # CuEquivariance config
         cueq_config = mc.get('cueq_config')
         if cueq_config is None or cueq_config:
             try:
@@ -111,7 +111,7 @@ class CDTrainer(BaseTrainer):
         return model
 
     def configure_dataloader(self):
-        """Charge 정보를 포함하는 DataLoader 구성"""
+        """Configure DataLoader with charge information."""
         jd = self.json_data
         charge_config = jd.get('charge', {})
         charge_key       = charge_config.get('charge_key', 'charges')
@@ -138,19 +138,19 @@ class CDTrainer(BaseTrainer):
     def compute_loss(self, preds, data):
         """
         Phase 2 loss:
-          total = enr_lambda × loss_E
-                + frc_lambda × loss_F
-                + chg_lambda × loss_Q   (CEP q_i vs NPA charges)
+          total = enr_lambda * loss_E
+                + frc_lambda * loss_F
+                + chg_lambda * loss_Q   (CEP q_i vs NPA charges)
 
-        charge conservation loss 는 CEP 가 hard constraint 로 보장하므로 제거.
+        Charge conservation loss removed since CEP guarantees it via hard constraint.
         """
-        # 기존 energy / force / stress loss
+        # Base energy / force / stress loss
         loss = super().compute_loss(preds, data)
 
         charge_config = self.json_data.get('charge', {})
         q_lambda = self.json_data['NN'].get('chg_lambda', 1.0)
 
-        # Atomic charge supervision (NPA charges 등)
+        # Atomic charge supervision (NPA charges etc.)
         if ("atomic_charges" in preds and "atomic_charges" in data):
             charge_target = data["atomic_charges"].flatten()
             charge_pred   = preds["atomic_charges"].flatten()
@@ -169,7 +169,7 @@ class CDTrainer(BaseTrainer):
         return loss
 
     def train_one_epoch(self, mode='train', data_loader=None):
-        """CPU 호환: cuda.synchronize 를 no-op 으로 우회."""
+        """CPU compatibility: bypass cuda.synchronize as no-op."""
         if self.device == 'cpu' or str(self.device) == 'cpu':
             _orig_sync = torch.cuda.synchronize
             torch.cuda.synchronize = lambda *a, **kw: None

@@ -1,19 +1,19 @@
 """
-QM9star PostgreSQL dump → xyz 변환 전처리 스크립트.
+QM9star PostgreSQL dump -> xyz conversion preprocessing script.
 
-PostgreSQL binary dump 파일에서 snapshot/molecule 데이터를 추출하여
-ASE가 읽을 수 있는 extended .xyz 파일로 변환합니다.
+Extracts snapshot/molecule data from a PostgreSQL binary dump file and
+converts it to an extended .xyz file readable by ASE.
 
-사용법:
-  1) pg_restore 사용 가능한 경우 (권장):
+Usage:
+  1) With pg_restore available (recommended):
      python qm9star_preprocessor.py --dump qm9star_archive_240912.sql --method pg_restore
 
-  2) pg_restore 없이 plain SQL 파일이 이미 있는 경우:
+  2) With an existing plain SQL file (no pg_restore needed):
      python qm9star_preprocessor.py --sql qm9star_plain.sql --method parse_sql
 
-단위 변환:
-  - 에너지: Hartree → eV (×27.2114)
-  - 힘: Hartree/bohr → eV/Å (×51.4221)
+Unit conversions:
+  - Energy: Hartree -> eV (x27.2114)
+  - Forces: Hartree/bohr -> eV/Ang (x51.4221)
 """
 
 import argparse
@@ -26,12 +26,12 @@ import numpy as np
 from pathlib import Path
 
 
-# 단위 변환 상수
+# Unit conversion constants
 HARTREE_TO_EV = 27.211386245988  # eV/Hartree
-BOHR_TO_ANGSTROM = 0.529177249   # Å/bohr
-HARTREE_BOHR_TO_EV_ANGSTROM = HARTREE_TO_EV / BOHR_TO_ANGSTROM  # eV/Å per Hartree/bohr
+BOHR_TO_ANGSTROM = 0.529177249   # Ang/bohr
+HARTREE_BOHR_TO_EV_ANGSTROM = HARTREE_TO_EV / BOHR_TO_ANGSTROM  # eV/Ang per Hartree/bohr
 
-# 원소 기호 → 원자번호 매핑
+# Element symbol -> atomic number mapping
 ELEMENT_SYMBOLS = [
     'X',  # 0
     'H', 'He', 'Li', 'Be', 'B', 'C', 'N', 'O', 'F', 'Ne',
@@ -48,10 +48,10 @@ ELEMENT_SYMBOLS = [
 
 
 def dump_to_plain_sql(dump_path, output_sql_path):
-    """pg_restore를 사용하여 binary dump를 plain SQL로 변환"""
-    print(f"[1/3] pg_restore로 plain SQL 변환 중...")
-    print(f"  입력: {dump_path}")
-    print(f"  출력: {output_sql_path}")
+    """Convert binary dump to plain SQL using pg_restore."""
+    print(f"[1/3] Converting to plain SQL via pg_restore...")
+    print(f"  Input: {dump_path}")
+    print(f"  Output: {output_sql_path}")
 
     try:
         result = subprocess.run(
@@ -59,25 +59,25 @@ def dump_to_plain_sql(dump_path, output_sql_path):
             capture_output=True, text=True
         )
         if result.returncode != 0:
-            # pg_restore는 DB 연결 없이도 -f 옵션으로 출력 가능
-            # 일부 경고는 무시
+            # pg_restore can output with -f option without DB connection
+            # Some warnings can be ignored
             if "database" in result.stderr.lower():
-                print(f"  경고 (무시 가능): {result.stderr[:200]}")
+                print(f"  Warning (ignorable): {result.stderr[:200]}")
             else:
-                print(f"  에러: {result.stderr[:500]}")
+                print(f"  Error: {result.stderr[:500]}")
                 return False
-        print(f"  완료!")
+        print(f"  Done!")
         return True
     except FileNotFoundError:
-        print("  ❌ pg_restore를 찾을 수 없습니다.")
-        print("  설치: sudo apt install postgresql-client")
+        print("  pg_restore not found.")
+        print("  Install: sudo apt install postgresql-client")
         return False
 
 
 def parse_pg_array(s):
-    """PostgreSQL 배열 문자열을 Python list로 변환.
-    예: '{1,2,3}' → [1, 2, 3]
-        '{{1,2,3},{4,5,6}}' → [[1,2,3],[4,5,6]]
+    """Convert PostgreSQL array string to Python list.
+    e.g.: '{1,2,3}' -> [1, 2, 3]
+          '{{1,2,3},{4,5,6}}' -> [[1,2,3],[4,5,6]]
     """
     if s is None or s == '\\N' or s == '':
         return None
@@ -86,7 +86,7 @@ def parse_pg_array(s):
     if not s.startswith('{'):
         return None
 
-    # 중첩 배열 처리
+    # Handle nested arrays
     depth = 0
     for c in s:
         if c == '{':
@@ -95,7 +95,7 @@ def parse_pg_array(s):
             break
 
     if depth == 1:
-        # 1D 배열
+        # 1D array
         inner = s[1:-1]
         if not inner:
             return []
@@ -103,7 +103,7 @@ def parse_pg_array(s):
                 else int(x)
                 for x in inner.split(',')]
     elif depth == 2:
-        # 2D 배열 {{1,2,3},{4,5,6}}
+        # 2D array {{1,2,3},{4,5,6}}
         inner = s[1:-1]  # {1,2,3},{4,5,6}
         rows = []
         current_row = []
@@ -131,7 +131,7 @@ def parse_pg_array(s):
                             else int(buf)
                         )
                     buf = ""
-                # 행 사이의 쉼표는 무시
+                # Commas between rows are ignored
             else:
                 buf += c
         return rows
@@ -140,15 +140,15 @@ def parse_pg_array(s):
 
 def parse_copy_data(lines, table_name, columns):
     """
-    COPY 구문의 데이터 행들을 파싱.
+    Parse data rows following a COPY statement.
 
     Args:
-        lines: SQL 파일에서 COPY 구문 이후의 데이터 라인들
-        table_name: 테이블 이름
-        columns: 컬럼 이름 리스트
+        lines: data lines after the COPY statement in the SQL file
+        table_name: table name
+        columns: list of column names
 
     Returns:
-        list of dict, 각 dict는 {column_name: value}
+        list of dict, each dict is {column_name: value}
     """
     records = []
     for line in lines:
@@ -169,13 +169,13 @@ def parse_copy_data(lines, table_name, columns):
 def parse_sql_file(sql_path, charge_type="npa_charges",
                    energy_type="U_0", max_samples=None):
     """
-    Plain SQL 파일에서 snapshot + molecule 데이터를 읽기.
+    Read snapshot + molecule data from a plain SQL file.
 
     Args:
-        sql_path: plain SQL 파일 경로
-        charge_type: 사용할 charge 종류
-        energy_type: 사용할 에너지 종류
-        max_samples: 최대 샘플 수 (None이면 전체)
+        sql_path: plain SQL file path
+        charge_type: charge type to use
+        energy_type: energy type to use
+        max_samples: maximum number of samples (None for all)
 
     Returns:
         list of dict with keys:
@@ -183,12 +183,12 @@ def parse_sql_file(sql_path, charge_type="npa_charges",
         - atomic_charges, total_charge
         - smiles, molecule_id
     """
-    print(f"[2/3] SQL 파일 파싱 중: {sql_path}")
+    print(f"[2/3] Parsing SQL file: {sql_path}")
     print(f"  charge_type: {charge_type}")
     print(f"  energy_type: {energy_type}")
 
-    # 먼저 molecule 테이블에서 total_charge 읽기
-    molecules = {}  # molecule_id → total_charge
+    # First read total_charge from molecule table
+    molecules = {}  # molecule_id -> total_charge
 
     snapshot_columns = []
     molecule_columns = []
@@ -201,7 +201,7 @@ def parse_sql_file(sql_path, charge_type="npa_charges",
         data_lines = []
 
         for line in f:
-            # COPY 구문 시작 감지
+            # Detect COPY statement start
             if line.startswith('COPY '):
                 match = re.match(
                     r'COPY\s+(?:public\.)?(\S+)\s+\((.+?)\)\s+FROM\s+stdin',
@@ -220,7 +220,7 @@ def parse_sql_file(sql_path, charge_type="npa_charges",
 
             if in_copy:
                 if line.rstrip('\n') == '\\.':
-                    # COPY 데이터 끝
+                    # End of COPY data
                     if current_table == 'molecule':
                         records = parse_copy_data(
                             data_lines, current_table, current_columns
@@ -230,14 +230,14 @@ def parse_sql_file(sql_path, charge_type="npa_charges",
                             tc = r.get('total_charge')
                             if mid and tc:
                                 molecules[mid] = float(tc)
-                        print(f"  molecule 테이블: {len(molecules)}개 로드")
+                        print(f"  molecule table: {len(molecules)} records loaded")
 
                     elif current_table == 'snapshot':
                         records = parse_copy_data(
                             data_lines, current_table, current_columns
                         )
                         snapshots = records
-                        print(f"  snapshot 테이블: {len(snapshots)}개 로드")
+                        print(f"  snapshot table: {len(snapshots)} records loaded")
 
                     in_copy = False
                     current_table = None
@@ -245,8 +245,8 @@ def parse_sql_file(sql_path, charge_type="npa_charges",
 
                 data_lines.append(line)
 
-    # 데이터 변환
-    print(f"\n[3/3] 데이터 변환 중...")
+    # Data conversion
+    print(f"\n[3/3] Converting data...")
     results = []
     skipped = 0
 
@@ -255,14 +255,14 @@ def parse_sql_file(sql_path, charge_type="npa_charges",
             break
 
         try:
-            # 원자 정보
+            # Atom information
             atoms = parse_pg_array(snap.get('atoms'))
             coords = parse_pg_array(snap.get('coords'))
             if atoms is None or coords is None:
                 skipped += 1
                 continue
 
-            # 에너지
+            # Energy
             energy_val = snap.get(energy_type)
             if energy_val is None or energy_val == '':
                 energy_val = snap.get('single_point_energy')
@@ -271,14 +271,14 @@ def parse_sql_file(sql_path, charge_type="npa_charges",
                 continue
             energy = float(energy_val) * HARTREE_TO_EV
 
-            # 힘
+            # Forces
             forces_raw = parse_pg_array(snap.get('forces'))
             if forces_raw is not None:
                 forces = np.array(forces_raw) * HARTREE_BOHR_TO_EV_ANGSTROM
             else:
                 forces = np.zeros((len(atoms), 3))
 
-            # Charge
+            # Charges
             charges_raw = parse_pg_array(snap.get(charge_type))
             if charges_raw is not None:
                 atomic_charges = np.array(charges_raw, dtype=float)
@@ -293,18 +293,18 @@ def parse_sql_file(sql_path, charge_type="npa_charges",
                 else:
                     atomic_charges = np.zeros(len(atoms))
 
-            # Total charge (molecule 테이블에서)
+            # Total charge (from molecule table)
             mol_id = snap.get('molecule_id')
             total_charge = molecules.get(mol_id, 0.0)
 
             result = {
                 'atoms': np.array(atoms, dtype=int),
                 'coords': np.array(coords, dtype=float),
-                'forces': forces.tolist() if isinstance(forces, np.ndarray) 
+                'forces': forces.tolist() if isinstance(forces, np.ndarray)
                           else forces,
                 'energy': energy,
-                'atomic_charges': atomic_charges.tolist() 
-                    if isinstance(atomic_charges, np.ndarray) 
+                'atomic_charges': atomic_charges.tolist()
+                    if isinstance(atomic_charges, np.ndarray)
                     else atomic_charges,
                 'total_charge': total_charge,
                 'molecule_id': mol_id,
@@ -315,22 +315,22 @@ def parse_sql_file(sql_path, charge_type="npa_charges",
         except Exception as e:
             skipped += 1
             if skipped <= 5:
-                print(f"  경고: record {i} 건너뜀 — {e}")
+                print(f"  Warning: skipping record {i} — {e}")
 
-    print(f"  변환 완료: {len(results)}개 성공, {skipped}개 건너뜀")
+    print(f"  Conversion complete: {len(results)} succeeded, {skipped} skipped")
     return results
 
 
 def write_extended_xyz(results, output_path, max_per_file=None):
     """
-    변환된 데이터를 extended xyz 형식으로 저장.
+    Save converted data in extended xyz format.
 
-    ASE가 읽을 수 있는 extended xyz:
-    - 첫 줄: 원자 수
-    - 둘째 줄: Properties 정보 (Lattice, energy, pbc 등)
-    - 나머지: element x y z fx fy fz charge
+    Extended xyz readable by ASE:
+    - Line 1: number of atoms
+    - Line 2: Properties info (Lattice, energy, pbc, etc.)
+    - Remaining: element x y z fx fy fz charge
     """
-    print(f"\n  xyz 파일 저장 중: {output_path}")
+    print(f"\n  Saving xyz file: {output_path}")
 
     with open(output_path, 'w') as f:
         for i, result in enumerate(results):
@@ -345,10 +345,10 @@ def write_extended_xyz(results, output_path, max_per_file=None):
             total_charge = result['total_charge']
             n_atoms = len(atoms)
 
-            # Extended XYZ 첫 줄
+            # Extended XYZ first line
             f.write(f"{n_atoms}\n")
 
-            # Properties 라인
+            # Properties line
             lattice = "30.0 0.0 0.0 0.0 30.0 0.0 0.0 0.0 30.0"
             props = (
                 f'Lattice="{lattice}" '
@@ -359,7 +359,7 @@ def write_extended_xyz(results, output_path, max_per_file=None):
             )
             f.write(f"{props}\n")
 
-            # 원자 데이터
+            # Atom data
             for j in range(n_atoms):
                 z = int(atoms[j])
                 symbol = ELEMENT_SYMBOLS[z] if z < len(ELEMENT_SYMBOLS) else f"X{z}"
@@ -374,60 +374,60 @@ def write_extended_xyz(results, output_path, max_per_file=None):
                     f"{fx:16.8f} {fy:16.8f} {fz:16.8f} {q:12.6f}\n"
                 )
 
-    print(f"  {min(len(results), max_per_file or len(results))}개 구조 저장 완료")
+    print(f"  {min(len(results), max_per_file or len(results))} structures saved")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='QM9star PostgreSQL dump → extended XYZ 변환'
+        description='QM9star PostgreSQL dump -> extended XYZ conversion'
     )
     parser.add_argument(
         '--dump', type=str, default=None,
-        help='PostgreSQL binary dump 파일 경로'
+        help='PostgreSQL binary dump file path'
     )
     parser.add_argument(
         '--sql', type=str, default=None,
-        help='Plain SQL 파일 경로 (pg_restore 이후)'
+        help='Plain SQL file path (after pg_restore)'
     )
     parser.add_argument(
         '--output', type=str, default='qm9star_data.xyz',
-        help='출력 xyz 파일 경로'
+        help='Output xyz file path'
     )
     parser.add_argument(
         '--charge-type', type=str, default='npa_charges',
         choices=['formal_charges', 'mulliken_charge', 'npa_charges',
                  'hirshfeld_charges', 'lowdin_charges'],
-        help='사용할 charge 종류 (기본: npa_charges)'
+        help='Charge type to use (default: npa_charges)'
     )
     parser.add_argument(
         '--energy-type', type=str, default='U_0',
         choices=['single_point_energy', 'U_0', 'U_T', 'H_T', 'G_T'],
-        help='사용할 에너지 종류 (기본: U_0)'
+        help='Energy type to use (default: U_0)'
     )
     parser.add_argument(
         '--max-samples', type=int, default=None,
-        help='최대 샘플 수'
+        help='Maximum number of samples'
     )
     args = parser.parse_args()
 
-    # Step 1: binary dump → plain SQL (필요시)
+    # Step 1: binary dump -> plain SQL (if needed)
     sql_path = args.sql
     if sql_path is None and args.dump is not None:
         sql_path = args.dump.replace('.sql', '_plain.sql')
         if not os.path.exists(sql_path):
             success = dump_to_plain_sql(args.dump, sql_path)
             if not success:
-                print("\n대안: pg_restore 없이 진행할 수 없습니다.")
+                print("\nAlternative: cannot proceed without pg_restore.")
                 print("  sudo apt install postgresql-client-16")
                 sys.exit(1)
         else:
-            print(f"  이미 변환된 SQL 파일 사용: {sql_path}")
+            print(f"  Using existing converted SQL file: {sql_path}")
 
     if sql_path is None:
-        print("--dump 또는 --sql 중 하나를 지정해주세요.")
+        print("Please specify either --dump or --sql.")
         sys.exit(1)
 
-    # Step 2: SQL 파싱
+    # Step 2: Parse SQL
     results = parse_sql_file(
         sql_path,
         charge_type=args.charge_type,
@@ -436,20 +436,20 @@ def main():
     )
 
     if not results:
-        print("데이터를 찾을 수 없습니다.")
+        print("No data found.")
         sys.exit(1)
 
-    # Step 3: XYZ로 저장
+    # Step 3: Save as XYZ
     write_extended_xyz(results, args.output, args.max_samples)
 
-    # 통계 출력
+    # Print statistics
     energies = [r['energy'] for r in results]
     charges_flat = [q for r in results for q in r['atomic_charges']]
-    print(f"\n=== 데이터 통계 ===")
-    print(f"  총 구조 수: {len(results)}")
-    print(f"  에너지 범위: {min(energies):.4f} ~ {max(energies):.4f} eV")
-    print(f"  charge 범위: {min(charges_flat):.4f} ~ {max(charges_flat):.4f}")
-    print(f"  출력 파일: {args.output}")
+    print(f"\n=== Data Statistics ===")
+    print(f"  Total structures: {len(results)}")
+    print(f"  Energy range: {min(energies):.4f} ~ {max(energies):.4f} eV")
+    print(f"  Charge range: {min(charges_flat):.4f} ~ {max(charges_flat):.4f}")
+    print(f"  Output file: {args.output}")
 
 
 if __name__ == '__main__':

@@ -1,19 +1,19 @@
 """
 Charge-dependent trainer Phase 3 (E) for BAM-torch.
 
-Phase 3 (E) 설계 — CEP as Pure Charge Predictor:
-  - E_total = E_SR only (U_CENT 에너지 기여 제거)
-  - charge_type 파라미터로 NPA / Mulliken / Hirshfeld 전환 가능
-  - Hard charge conservation (CEP Lagrange 해석해) 유지
-  - 물리적 mismatch 해결: QEq 에너지 가정 없이 전하만 학습
+Phase 3 (E) design — CEP as Pure Charge Predictor:
+  - E_total = E_SR only (U_CENT energy contribution removed)
+  - charge_type parameter for NPA / Mulliken / Hirshfeld switching
+  - Hard charge conservation (CEP Lagrange analytical solution) maintained
+  - Resolves physical mismatch: learns charges without QEq energy assumptions
 
-Phase 2 (CDTrainer) 와의 차이:
-  - use_cent_energy: False (기본값, config 로 override 가능)
-  - charge_type: 'npa' / 'mulliken' / 'hirshfeld' 선택
-  - ChargeRACEv3 모델 사용
+Differences from Phase 2 (CDTrainer):
+  - use_cent_energy: False (default, overridable via config)
+  - charge_type: 'npa' / 'mulliken' / 'hirshfeld' selection
+  - Uses ChargeRACEv3 model
 
-Phase 3.5 변경 (Issue #5):
-  - parse_model_config() / parse_charge_config() 중앙 유틸로 파라미터 매핑
+Phase 3.5 changes (Issue #5):
+  - parse_model_config() / parse_charge_config() centralized utils for parameter mapping
 """
 
 from bam_torch.charge_dependent.training.cd_trainer import CDTrainer
@@ -27,23 +27,23 @@ from bam_torch.utils.model_config import (
 
 class CDTrainerV3(CDTrainer):
     """
-    Phase 3 (E) Charge-dependent 모델 학습 Trainer.
+    Phase 3 (E) Charge-dependent model Trainer.
 
-    CDTrainer 를 상속하며 set_model() 만 오버라이드:
-      - ChargeRACEv3 모델 사용
+    Inherits CDTrainer and overrides only set_model():
+      - Uses ChargeRACEv3 model
       - use_cent_energy=False (E_total = E_SR)
-      - charge_type config 지원
+      - charge_type config support
 
-    Loss 구성 (Phase 2 와 동일):
-      total_loss = enr_lambda × loss_E
-                 + frc_lambda × loss_F
-                 + chg_lambda × loss_Q  (pred vs target charges)
+    Loss composition (same as Phase 2):
+      total_loss = enr_lambda * loss_E
+                 + frc_lambda * loss_F
+                 + chg_lambda * loss_Q  (pred vs target charges)
 
-    Config 예시 (charge 섹션):
+    Config example (charge section):
       "charge": {
           "cep_hidden_dim": 64,
-          "charge_type": "mulliken",   # "npa" / "mulliken" / "hirshfeld"
-          "use_cent_energy": false,    # true 이면 Phase 2 동작
+          "charge_type": "mulliken",   // "npa" / "mulliken" / "hirshfeld"
+          "use_cent_energy": false,    // true reverts to Phase 2 behavior
           "charge_key": "charges",
           "total_charge_key": "total_charge",
           "charge_loss": "mse"
@@ -54,9 +54,9 @@ class CDTrainerV3(CDTrainer):
         super().__init__(json_data, rank, world_size)
 
     def set_model(self):
-        """ChargeRACEv3 (Phase 3, CEP as pure charge predictor) 모델 구성.
+        """Configure ChargeRACEv3 (Phase 3, CEP as pure charge predictor) model.
 
-        Uses centralized parse_model_config() for config → constructor
+        Uses centralized parse_model_config() for config -> constructor
         parameter mapping (Phase 3.5, Issue #5 fix).
         """
         # Common model parameters (centralized mapping)

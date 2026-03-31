@@ -1,21 +1,21 @@
 """
-CENT2 기반 Charge Equilibration Process (CEP) Block.
+CENT2-based Charge Equilibration Process (CEP) Block.
 
-Phase 2 구현:
-  χ_i = MLP(scalar node features)  — ANN 예측 환경 의존 전기음성도
-  J_i = softplus(J_raw[species])   — 원소별 화학적 경도 (학습 파라미터)
+Phase 2 implementation:
+  chi_i = MLP(scalar node features)  — ANN-predicted environment-dependent electronegativity
+  J_i = softplus(J_raw[species])     — per-element chemical hardness (learnable parameter)
 
-  CEP 해석해 (Lagrange 승수법):
-    min Σ_i [ χ_i q_i + ½ J_i q_i² ]   s.t.  Σ_i q_i = Q_total
+  CEP analytical solution (Lagrange multiplier method):
+    min sum_i [ chi_i q_i + 0.5 J_i q_i^2 ]   s.t.  sum_i q_i = Q_total
 
-    → λ   = (Q_total + Σ_i χ_i/J_i) / Σ_i (1/J_i)   [그래프별]
-    → q_i = (λ - χ_i) / J_i                           [원자별]
+    -> lambda = (Q_total + sum_i chi_i/J_i) / sum_i (1/J_i)   [per graph]
+    -> q_i = (lambda - chi_i) / J_i                            [per atom]
 
-  전하 보존이 수학적으로 보장됨 (hard constraint).
+  Charge conservation is mathematically guaranteed (hard constraint).
 
-  U_CENT = Σ_i [ χ_i q_i + ½ J_i q_i² ]
+  U_CENT = sum_i [ chi_i q_i + 0.5 J_i q_i^2 ]
 
-참고:
+Reference:
   Khajehpasha et al., Phys. Rev. B 105, 144106 (2022)  — CENT2
   Ghasemi & Goedecker, J. Chem. Phys. 154, 074107 (2021) — CENT1
 """
@@ -31,16 +31,16 @@ from bam_torch.utils.scatter import scatter_sum
 
 class CEPBlock(tnn.Module):
     """
-    CENT2 기반 Charge Equilibration Process Block.
+    CENT2-based Charge Equilibration Process Block.
 
-    주어진 node features에서 환경 의존 전기음성도 χ_i를 예측하고,
-    Lagrange 승수법으로 원자 전하 q_i를 해석적으로 결정한다.
-    전하 보존 (Σ q_i = Q_total) 이 항상 수학적으로 보장된다.
+    Predicts environment-dependent electronegativity chi_i from node features,
+    then analytically determines atomic charges q_i via Lagrange multiplier method.
+    Charge conservation (sum q_i = Q_total) is always mathematically guaranteed.
 
     Args:
-        irreps_in   : 입력 node features의 irreps (scalar 부분 추출에 사용)
-        num_species : 원소 종류 수 (J_i 파라미터 테이블 크기)
-        hidden_dim  : χ_i 예측 MLP의 hidden dimension (기본 64)
+        irreps_in   : irreps of input node features (used to extract scalar components)
+        num_species : number of element types (size of J_i parameter table)
+        hidden_dim  : hidden dimension of chi_i prediction MLP (default 64)
     """
 
     def __init__(
@@ -51,10 +51,10 @@ class CEPBlock(tnn.Module):
     ):
         super().__init__()
 
-        # scalar(l=0, even parity) 성분 차원
+        # scalar (l=0, even parity) component dimension
         self.scalar_dim: int = irreps_in.count(o3.Irrep(0, 1))
 
-        # χ_i 예측 MLP (환경 의존 전기음성도)
+        # chi_i prediction MLP (environment-dependent electronegativity)
         self.chi_mlp = tnn.Sequential(
             tnn.Linear(self.scalar_dim, hidden_dim),
             tnn.SiLU(),
@@ -63,38 +63,38 @@ class CEPBlock(tnn.Module):
             tnn.Linear(hidden_dim, 1),
         )
 
-        # J_i : 원소별 화학적 경도 (학습 파라미터, softplus 로 양수 보장)
+        # J_i : per-element chemical hardness (learnable, softplus ensures positive)
         self.J_raw = tnn.Parameter(torch.ones(num_species))
 
     def forward(
         self,
         node_feats: torch.Tensor,       # [num_nodes, irreps_dim]
-        species: torch.Tensor,           # [num_nodes]  원소 인덱스
-        total_charge: torch.Tensor,      # [num_graphs] 총 전하 (Q_total)
-        batch: torch.Tensor,             # [num_nodes]  배치 인덱스
+        species: torch.Tensor,           # [num_nodes]  element index
+        total_charge: torch.Tensor,      # [num_graphs] total charge (Q_total)
+        batch: torch.Tensor,             # [num_nodes]  batch index
         num_graphs: int,
     ) -> Dict[str, torch.Tensor]:
         """
         Returns:
-            atomic_charges : [num_nodes]  CEP로 결정된 원자 전하 q_i
-            chi            : [num_nodes]  예측된 원자 전기음성도 χ_i
-            J              : [num_nodes]  원소별 화학적 경도 J_i
-            U_CENT         : [num_graphs] CEP 정전기 에너지
-            total_charge   : [num_graphs] Σ q_i (보존 검증용 ≈ 입력 Q_total)
+            atomic_charges : [num_nodes]  CEP-determined atomic charges q_i
+            chi            : [num_nodes]  predicted atomic electronegativity chi_i
+            J              : [num_nodes]  per-element chemical hardness J_i
+            U_CENT         : [num_graphs] CEP electrostatic energy
+            total_charge   : [num_graphs] sum q_i (for conservation verification, ~ input Q_total)
         """
-        # ── χ_i 예측 ─────────────────────────────────────────────────────
-        # scalar(l=0) features 만 추출 (앞쪽에 위치)
+        # ── chi_i prediction ───────────────────────────────────────────────
+        # Extract scalar (l=0) features only (located at the front)
         scalar_feats = node_feats[:, :self.scalar_dim]
         chi = self.chi_mlp(scalar_feats).squeeze(-1)          # [N]
 
-        # ── J_i (softplus: 항상 양수) ────────────────────────────────────
+        # ── J_i (softplus: always positive) ────────────────────────────────
         J = tnn.functional.softplus(self.J_raw)[species]      # [N]
 
-        # ── CEP 해석해 (Lagrange 승수) ────────────────────────────────────
+        # ── CEP analytical solution (Lagrange multiplier) ──────────────────
         eps: float = 1e-8
         inv_J = 1.0 / (J + eps)                               # [N]
 
-        # 그래프별 집계
+        # Per-graph aggregation
         sum_chi_over_J = scatter_sum(
             chi * inv_J, batch, dim=0, dim_size=num_graphs,
         )                                                      # [G]
@@ -102,20 +102,20 @@ class CEPBlock(tnn.Module):
             inv_J, batch, dim=0, dim_size=num_graphs,
         )                                                      # [G]
 
-        # λ = (Q_total + Σ χ/J) / Σ (1/J)
+        # lambda = (Q_total + sum chi/J) / sum (1/J)
         lam = (total_charge + sum_chi_over_J) / (sum_inv_J + eps)  # [G]
         lam_per_atom = lam[batch]                              # [N]
 
-        # q_i = (λ - χ_i) / J_i  →  hard charge conservation
+        # q_i = (lambda - chi_i) / J_i  ->  hard charge conservation
         q = (lam_per_atom - chi) * inv_J                      # [N]
 
-        # ── U_CENT = Σ_i [ χ_i q_i + ½ J_i q_i² ] ───────────────────────
+        # ── U_CENT = sum_i [ chi_i q_i + 0.5 J_i q_i^2 ] ─────────────────
         U_CENT_per_atom = chi * q + 0.5 * J * q.pow(2)
         U_CENT = scatter_sum(
             U_CENT_per_atom, batch, dim=0, dim_size=num_graphs,
         )                                                      # [G]
 
-        # 보존 검증용
+        # For conservation verification
         q_total = scatter_sum(q, batch, dim=0, dim_size=num_graphs)
 
         return {

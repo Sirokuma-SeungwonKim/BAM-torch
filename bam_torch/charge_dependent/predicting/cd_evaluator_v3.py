@@ -1,17 +1,17 @@
 """
-Charge-dependent model 평가기 Phase 3 (E).
+Charge-dependent model evaluator Phase 3 (E).
 
-Phase 2 CDEvaluator 와의 차이:
-  - CDTrainerV3 를 상속 (CDTrainer 대신)
-  - set_model() 이 ChargeRACEv3 를 생성
-  - Phase 3 체크포인트의 use_cent_energy / charge_type 속성 정상 로드
+Differences from Phase 2 CDEvaluator:
+  - Inherits CDTrainerV3 (instead of CDTrainer)
+  - set_model() creates ChargeRACEv3
+  - Properly loads Phase 3 checkpoint attributes (use_cent_energy / charge_type)
 
-Phase 2 CDEvaluator 를 Phase 3 체크포인트로 실행하면 발생하는 문제:
-  1) CDTrainer.set_model() → ChargeRACE (Phase 2) 생성
-  2) ChargeRACEv3 state_dict 키 불일치 (use_cent_energy 등 누락)
-  3) forward() 에서 AttributeError 또는 에너지 계산 오류
+Issues when running Phase 2 CDEvaluator with Phase 3 checkpoint:
+  1) CDTrainer.set_model() -> creates ChargeRACE (Phase 2)
+  2) ChargeRACEv3 state_dict key mismatch (use_cent_energy etc. missing)
+  3) AttributeError or energy calculation error in forward()
 
-이를 해결하기 위해 CDTrainerV3 를 상속하는 CDEvaluatorV3 를 별도 생성.
+CDEvaluatorV3 inherits CDTrainerV3 to resolve this.
 """
 
 import torch
@@ -32,12 +32,12 @@ from bam_torch.utils.utils import date, on_exit
 
 class CDEvaluatorV3(CDTrainerV3):
     """
-    Phase 3 (E) Charge-dependent model 평가기.
+    Phase 3 (E) Charge-dependent model evaluator.
 
-    CDTrainerV3 를 상속하며 평가 시:
-      - energy, forces 예측 정확도 평가
-      - CEP atomic charges (q_i) 예측 정확도 평가
-      - chi (전기음성도), U_CENT, E_SR 수집
+    Inherits CDTrainerV3 and evaluates:
+      - energy, forces prediction accuracy
+      - CEP atomic charges (q_i) prediction accuracy
+      - chi (electronegativity), U_CENT, E_SR collection
     """
 
     def __init__(self, json_data, rank=0, world_size=1):
@@ -55,7 +55,7 @@ class CDEvaluatorV3(CDTrainerV3):
         super().__init__(self.json_data, self.rank, self.world_size)
 
     def setup(self):
-        """평가에 필요한 컴포넌트 구성"""
+        """Configure components required for evaluation."""
         self.set_random_seed()
         self.device = self.configure_device()
         self.model, self.n_params, self.model_ckpt, self.start_epoch = \
@@ -68,7 +68,7 @@ class CDEvaluatorV3(CDTrainerV3):
             self.configure_logger()
 
     def evaluate(self, element_wise=True):
-        """모델 평가 수행. Phase 3 CEP 결과 수집."""
+        """Run model evaluation. Collects Phase 3 CEP results."""
         self.logger.print_logger_head()
         eval_loss_dict = {
             'loss': [], 'loss_e': [], 'loss_f': [], 'loss_q': [],
@@ -119,7 +119,7 @@ class CDEvaluatorV3(CDTrainerV3):
             test_values['exact_force_y'].append(data['forces'][:, 1].detach().cpu())
             test_values['exact_force_z'].append(data['forces'][:, 2].detach().cpu())
 
-            # CEP 결과 수집
+            # CEP results collection
             if "atomic_charges" in preds:
                 test_values['atomic_charges'].append(
                     preds['atomic_charges'].detach().cpu()
@@ -162,7 +162,7 @@ class CDEvaluatorV3(CDTrainerV3):
             if i % 100 == 0:
                 gc.collect()
 
-        # 결과 요약
+        # Results summary
         eval_loss_dict = {
             key: torch.mean(torch.tensor(value))
             for key, value in eval_loss_dict.items()
@@ -183,7 +183,7 @@ class CDEvaluatorV3(CDTrainerV3):
         print(f"\n\033[32mPrediction values saved to test_values.pkl\033[0m")
 
     def get_scale_shift_correction(self, element_wise):
-        """학습 시 저장된 scale-shift 보정값 로드"""
+        """Load scale-shift correction values saved during training."""
         if element_wise:
             try:
                 e_corr = torch.tensor(
@@ -207,7 +207,7 @@ class CDEvaluatorV3(CDTrainerV3):
         return e_corr, element_wise
 
     def configure_dataloader(self):
-        """평가용 DataLoader 구성 (charge 포함)"""
+        """Configure evaluation DataLoader (with charge data)."""
         jd = self.json_data
         charge_config = jd.get('charge', {})
         charge_key       = charge_config.get('charge_key', 'charges')
