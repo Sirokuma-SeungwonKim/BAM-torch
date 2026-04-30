@@ -132,6 +132,7 @@ class CDTrainer(BaseTrainer):
                 total_charge_key=total_charge_key,
                 rank=self.rank,
                 world_size=self.world_size,
+                cache_dir=jd.get('cache_dir'),
             )
         return train_loader, valid_loader, uniq_element, enr_avg_per_element
 

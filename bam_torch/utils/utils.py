@@ -5,6 +5,7 @@ from matscipy.neighbours import neighbour_list
 from tqdm import tqdm
 
 import torch
+import torch.distributed as dist
 from torch import vmap
 from torch_geometric.data import Data
 from torch_geometric.data import Batch as DataBatch
@@ -12,6 +13,9 @@ from torch_geometric.loader import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 import os
+import gc
+import random as _random
+import hashlib
 import pprint
 from copy import deepcopy
 from datetime import datetime
@@ -209,56 +213,324 @@ def get_graphset_with_pad(graphset, pad_nodes_to, pad_edges_to):
     return graph_list
 
 
-def get_dataloader(fname, ntrain, nvalid, 
-                   nbatch, cutoff, random_seed, 
+def _get_base_cache_path(fname, ntrain, nvalid, random_seed, cutoff,
+                         regress_forces, max_neigh):
+    """Generate deterministic cache file path for base dataloader."""
+    fsize = os.path.getsize(fname) if os.path.exists(fname) else 0
+    key = (f"base|{os.path.abspath(fname)}|{fsize}|{ntrain}|{nvalid}|"
+           f"{random_seed}|{cutoff}|{regress_forces}|{max_neigh}")
+    h = hashlib.md5(key.encode()).hexdigest()[:12]
+    basename = os.path.splitext(os.path.basename(fname))[0]
+    cache_dir = os.path.dirname(os.path.abspath(fname))
+    return os.path.join(cache_dir, f".cache_{basename}_{h}.pt")
+
+
+def _wait_for_cache(cache_path, rank, poll_interval=10):
+    """Wait for rank 0 to finish writing the cache file.
+
+    Uses file-based synchronization instead of dist.barrier() to avoid
+    NCCL timeout when rank 0 takes a long time to convert large datasets.
+    """
+    import time
+    ready_path = cache_path + '.ready'
+    if rank == 0:
+        with open(ready_path, 'w') as f:
+            f.write('ready')
+    else:
+        while not os.path.exists(ready_path):
+            time.sleep(poll_interval)
+        time.sleep(1)  # ensure file is fully flushed
+
+
+def _scan_max_padding(shard_files, cache_dir):
+    """Scan all shards one-at-a-time to find global max nodes/edges.
+
+    Peak RAM = 1 shard (same as ShardedDataset).  Required to determine
+    uniform padding for Base RACE's fixed-size forward pass.
+    """
+    max_nodes = max_edges = 0
+    for fname, _ in tqdm(shard_files, desc="[Base] Scanning padding", leave=False):
+        shard = torch.load(os.path.join(cache_dir, fname), weights_only=False)
+        for g in shard:
+            if g.num_nodes > max_nodes:
+                max_nodes = g.num_nodes
+            if g.num_edges > max_edges:
+                max_edges = g.num_edges
+        del shard
+        gc.collect()
+    return max_nodes, max_edges
+
+
+class PaddedShardedDataset(torch.utils.data.IterableDataset):
+    """Streams Base RACE graphs one shard at a time with uniform padding.
+
+    Identical streaming logic to ShardedDataset (cd_utils), but each graph
+    is zero-padded to (pad_nodes, pad_edges) for Base RACE's fixed-size pass.
+    Peak RAM = 1 shard, no accumulation.
+    """
+
+    def __init__(self, shard_files, cache_dir, pad_nodes, pad_edges,
+                 shuffle=False, seed=42):
+        self.shard_files = list(shard_files)
+        self.cache_dir = cache_dir
+        self.pad_nodes = pad_nodes
+        self.pad_edges = pad_edges
+        self.shuffle = shuffle
+        self.seed = seed
+        self._iter_count = 0
+        self._n_graphs = sum(c for _, c in self.shard_files)
+
+    def __len__(self):
+        return self._n_graphs
+
+    def __iter__(self):
+        self._iter_count += 1
+        rng = _random.Random(self.seed + self._iter_count)
+
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            my_shards = self.shard_files[worker_info.id::worker_info.num_workers]
+        else:
+            my_shards = self.shard_files
+        my_shards = list(my_shards)
+        if self.shuffle:
+            rng.shuffle(my_shards)
+
+        for fname, _count in my_shards:
+            shard = torch.load(os.path.join(self.cache_dir, fname),
+                               weights_only=False)
+            if self.shuffle:
+                rng.shuffle(shard)
+            for g in shard:
+                yield self._pad_graph(g)
+            del shard
+            gc.collect()
+
+    def _pad_graph(self, data):
+        data = deepcopy(data)
+        n = data.num_nodes
+        if n < self.pad_nodes:
+            p = self.pad_nodes - n
+            data.positions = torch.cat([data.positions, torch.zeros(p, 3)], 0)
+            data.forces    = torch.cat([data.forces,    torch.zeros(p, 3)], 0)
+            data.species   = torch.cat(
+                [data.species, torch.zeros(p, dtype=torch.long)], 0)
+            data.num_nodes = self.pad_nodes
+        e = data.num_edges
+        if e < self.pad_edges:
+            p = self.pad_edges - e
+            data.edges      = torch.cat([data.edges, torch.zeros(p, 3)], 0)
+            data.edge_index = torch.cat(
+                [data.edge_index, torch.zeros(2, p, dtype=torch.long)], 1)
+            data.num_edges  = self.pad_edges
+        return data
+
+
+def _load_sharded_cache_base(cache_dir, manifest_name='manifest_base.pt'):
+    """Load pre-built sharded cache for Base RACE from manifest + shard files.
+
+    After loading, applies padding to uniform size (Base RACE requirement).
+
+    Returns:
+        train_graphset, valid_graphset, uniq_element, enr_avg_per_element
+    """
+    manifest_path = os.path.join(cache_dir, manifest_name)
+    manifest = torch.load(manifest_path, weights_only=False)
+
+    print(f"\033[32mLoading sharded cache (base): {cache_dir}\033[0m")
+    print(f"  Train: {manifest['n_train']:,} graphs in "
+          f"{len(manifest['train_shards'])} shards")
+    print(f"  Valid: {manifest['n_valid']:,} graphs in "
+          f"{len(manifest['valid_shards'])} shards")
+
+    # Load and pad each split independently
+    results = []
+    for split_key, label in [('train_shards', 'train'), ('valid_shards', 'valid')]:
+        graphs = []
+        for fname_shard, count in tqdm(manifest[split_key],
+                                       desc=f"Loading {label} shards"):
+            shard = torch.load(os.path.join(cache_dir, fname_shard),
+                               weights_only=False)
+            graphs.extend(shard)
+            del shard
+
+        # Pad to uniform size
+        pad_nodes = max(g.num_nodes for g in graphs)
+        pad_edges = max(g.num_edges for g in graphs)
+        print(f"  {label}: padding to nodes={pad_nodes}, edges={pad_edges}")
+        graphs = get_graphset_with_pad(graphs, pad_nodes, pad_edges)
+        results.append(graphs)
+
+    print(f"  Loaded: {len(results[0]):,} train / {len(results[1]):,} valid")
+    return (results[0], results[1],
+            manifest['uniq_element'], manifest['enr_avg_per_element'])
+
+
+def get_dataloader(fname, ntrain, nvalid,
+                   nbatch, cutoff, random_seed,
                    element=None, regress_forces=True,
                    max_neigh=None,
-                   rank=0, world_size=1):
-    msg = ''
-    if type(ntrain) == str: 
-        train_data = read(ntrain, index=slice(None))
-        valid_data = read(nvalid, index=slice(None))
-        msg += 'number of data:\n'
-        msg += f'\033[33m -- training      {len(train_data)}\n'
-        msg += f' -- validation    {len(valid_data)}\033[0m\n\n'
-        traj = train_data + valid_data
-    else:
-        nsamp = ntrain + nvalid
-        traj = read(fname, index=slice(None))[-nsamp:]
-        torch.manual_seed(random_seed)
-        torch.cuda.manual_seed_all(random_seed)
-        idx = torch.arange(nsamp)
-        idx = idx[torch.randperm(nsamp)] 
-        idx_train = idx[:ntrain]
-        idx_valid = idx[ntrain:]   
-        train_data = [traj[i] for i in idx_train]
-        valid_data = [traj[i] for i in idx_valid]
-        msg += 'number of data:\n'
-        msg += f'\033[33m -- training      {len(train_data)}\n'
-        msg += f' -- validation    {len(valid_data)}\033[0m\n\n'
+                   rank=0, world_size=1, cache_dir=None):
+    # --- Pre-built sharded cache: PaddedShardedDataset streaming ---
+    if cache_dir is not None:
+        manifest_path = os.path.join(cache_dir, 'manifest_base.pt')
+        if os.path.exists(manifest_path):
+            manifest = torch.load(manifest_path, weights_only=False)
+            all_train_shards = manifest['train_shards']
+            all_valid_shards = manifest['valid_shards']
+            uniq_element = manifest['uniq_element']
+            enr_avg_per_element = manifest['enr_avg_per_element']
 
-    if element == None or element == 'auto':
-        element = sorted(
-            list(set(atom.number for atoms in traj 
-                                  for atom in atoms))
-        )  # traj: ase.Atoms
-    enr_avg_per_element, uniq_element, enr_var = get_enr_avg_per_element (traj, element) 
-    msg += f'mean energy per element:\n {enr_avg_per_element}\n'
-    if rank == 0:
-        print(msg)
-    
+            # DDP floor split (same logic as CD path)
+            n_train_per_rank = len(all_train_shards) // world_size
+            n_valid_per_rank = max(1, len(all_valid_shards) // world_size)
+            my_train_shards = all_train_shards[
+                rank * n_train_per_rank:(rank + 1) * n_train_per_rank]
+            my_valid_shards = all_valid_shards[
+                rank * n_valid_per_rank:(rank + 1) * n_valid_per_rank]
+
+            # Rank 0: scan for global padding (peak RAM = 1 shard ≈ 11 GB)
+            # Result cached to disk so subsequent runs skip the scan.
+            _pad_path = os.path.join(cache_dir, '_base_padding.pt')
+            if rank == 0:
+                if os.path.exists(_pad_path):
+                    _pd = torch.load(_pad_path, weights_only=False)
+                    pad_nodes, pad_edges = _pd['pad_nodes'], _pd['pad_edges']
+                    print(f"\033[32m[Base] Padding (cached): "
+                          f"max_nodes={pad_nodes}, max_edges={pad_edges}\033[0m")
+                else:
+                    print(f"\033[32m[Base] Scanning shards for padding...\033[0m")
+                    pad_nodes, pad_edges = _scan_max_padding(
+                        all_train_shards + all_valid_shards, cache_dir)
+                    torch.save({'pad_nodes': pad_nodes,
+                                'pad_edges': pad_edges}, _pad_path)
+                    print(f"  pad_nodes={pad_nodes}, pad_edges={pad_edges}  "
+                          f"(saved to {_pad_path})")
+                _wait_for_cache(_pad_path, rank=0)
+            else:
+                _wait_for_cache(_pad_path, rank)
+                _pd = torch.load(_pad_path, weights_only=False)
+                pad_nodes, pad_edges = _pd['pad_nodes'], _pd['pad_edges']
+
+            n_drop_tr = len(all_train_shards) - n_train_per_rank * world_size
+            n_drop_va = len(all_valid_shards) - n_valid_per_rank * world_size
+            if rank == 0:
+                print(f"  Train: {n_train_per_rank} shards/rank "
+                      f"({n_drop_tr} dropped for DDP balance)")
+                print(f"  Valid: {n_valid_per_rank} shards/rank "
+                      f"({n_drop_va} dropped)")
+
+            train_dataset = PaddedShardedDataset(
+                my_train_shards, cache_dir, pad_nodes, pad_edges,
+                shuffle=True, seed=random_seed)
+            valid_dataset = PaddedShardedDataset(
+                my_valid_shards, cache_dir, pad_nodes, pad_edges,
+                shuffle=False, seed=random_seed)
+
+            train_loader = DataLoader(
+                train_dataset, batch_size=nbatch,
+                num_workers=2, pin_memory=True,
+                drop_last=True, persistent_workers=True)
+            valid_loader = DataLoader(
+                valid_dataset, batch_size=nbatch,
+                num_workers=0, pin_memory=True, drop_last=False)
+            return train_loader, valid_loader, uniq_element, enr_avg_per_element
+
+    # For DDP with integer ntrain/nvalid, use rank-0 caching
+    use_cache = (world_size > 1 and not isinstance(ntrain, str))
+    cache_path = None
+    if use_cache:
+        cache_path = _get_base_cache_path(
+            fname, ntrain, nvalid, random_seed, cutoff,
+            regress_forces, max_neigh,
+        )
+
+    if use_cache and rank != 0:
+        # Non-rank-0: wait for rank 0 via file-based sync, then load cache
+        _wait_for_cache(cache_path, rank)
+        cached = torch.load(cache_path, weights_only=False)
+        train_graphset = cached['train_graphset']
+        valid_graphset = cached['valid_graphset']
+        uniq_element = cached['uniq_element']
+        enr_avg_per_element = cached['enr_avg_per_element']
+    else:
+        # Rank 0 (or single-GPU): check cache first
+        if use_cache and os.path.exists(cache_path):
+            print(f"\033[32mLoading cached dataset: {cache_path}\033[0m")
+            cached = torch.load(cache_path, weights_only=False)
+            train_graphset = cached['train_graphset']
+            valid_graphset = cached['valid_graphset']
+            uniq_element = cached['uniq_element']
+            enr_avg_per_element = cached['enr_avg_per_element']
+            del cached
+        else:
+            # Original data loading logic
+            msg = ''
+            if type(ntrain) == str:
+                train_data = read(ntrain, index=slice(None))
+                valid_data = read(nvalid, index=slice(None))
+                msg += 'number of data:\n'
+                msg += f'\033[33m -- training      {len(train_data)}\n'
+                msg += f' -- validation    {len(valid_data)}\033[0m\n\n'
+                traj = train_data + valid_data
+            else:
+                nsamp = ntrain + nvalid
+                traj = read(fname, index=slice(None))[-nsamp:]
+                torch.manual_seed(random_seed)
+                torch.cuda.manual_seed_all(random_seed)
+                idx = torch.arange(nsamp)
+                idx = idx[torch.randperm(nsamp)]
+                idx_train = idx[:ntrain]
+                idx_valid = idx[ntrain:]
+                train_data = [traj[i] for i in idx_train]
+                valid_data = [traj[i] for i in idx_valid]
+                msg += 'number of data:\n'
+                msg += f'\033[33m -- training      {len(train_data)}\n'
+                msg += f' -- validation    {len(valid_data)}\033[0m\n\n'
+
+            if element == None or element == 'auto':
+                element = sorted(
+                    list(set(atom.number for atoms in traj
+                                          for atom in atoms))
+                )  # traj: ase.Atoms
+            enr_avg_per_element, uniq_element, enr_var = get_enr_avg_per_element(traj, element)
+            msg += f'mean energy per element:\n {enr_avg_per_element}\n'
+            if rank == 0:
+                print(msg)
+            del traj  # free ASE trajectory memory
+
+            all_graphsets = []
+            for dataset in [train_data, valid_data]:
+                graphset = get_graphset(dataset, cutoff, uniq_element,
+                                        enr_avg_per_element, enr_var,
+                                        regress_forces, max_neigh)
+                pad_nodes_to = 0
+                pad_edges_to = 0
+                for graph in graphset:
+                    pad_nodes_to = max(graph.num_nodes, pad_nodes_to)
+                    pad_edges_to = max(graph.num_edges, pad_edges_to)
+                graphset = get_graphset_with_pad(deepcopy(graphset), pad_nodes_to, pad_edges_to)
+                all_graphsets.append(graphset)
+            del train_data, valid_data
+            train_graphset, valid_graphset = all_graphsets
+
+            # Save cache for other ranks
+            if use_cache:
+                print(f"\033[32mSaving dataset cache: {cache_path}\033[0m")
+                torch.save({
+                    'train_graphset': train_graphset,
+                    'valid_graphset': valid_graphset,
+                    'uniq_element': uniq_element,
+                    'enr_avg_per_element': enr_avg_per_element,
+                }, cache_path)
+
+        # Rank 0 signals other ranks via file-based sync
+        if use_cache:
+            _wait_for_cache(cache_path, rank=0)
+
+    # Create DataLoaders
     loaders = []
-    for dataset in [train_data, valid_data]:
-        graphset = get_graphset(dataset, cutoff, uniq_element, 
-                                enr_avg_per_element, enr_var,
-                                regress_forces, max_neigh)
-        pad_nodes_to = 0 # nbatch * max_nodes 
-        pad_edges_to = 0 # nbatch * max_edges
-        for graph in graphset:
-            pad_nodes_to = max(graph.num_nodes, pad_nodes_to)
-            pad_edges_to = max(graph.num_edges, pad_edges_to)
-        graphset = get_graphset_with_pad(deepcopy(graphset), pad_nodes_to, pad_edges_to)
-        #padded_graphset = graphset
+    for graphset in [train_graphset, valid_graphset]:
         data_sampler = None
         if world_size > 1:
             data_sampler = DistributedSampler(
@@ -273,8 +545,7 @@ def get_dataloader(fname, ntrain, nvalid,
                             collate_fn=None,
                             sampler=data_sampler)
         loaders.append(loader)
-        # train_loader, test_loader
-    return loaders[0], loaders[1], uniq_element, enr_avg_per_element  
+    return loaders[0], loaders[1], uniq_element, enr_avg_per_element
 
 
 def get_dataloader_multihead(datasets_config, cutoff, nbatch, regress_forces=True,
