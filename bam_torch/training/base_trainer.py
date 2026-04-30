@@ -67,11 +67,12 @@ class BaseTrainer:
     def train(self):
         """Main training loop for BAM models.
         """
-        # Initial test
+        # Initial test (epoch 0 baseline, prints logger head + ep0 loss line)
         self.initial_test()
 
-        # Print logger head
-        if self.rank == 0:
+        # Print logger head only if initial_test did not already print it
+        # (e.g. when initial_test was overridden in subclass)
+        if self.rank == 0 and not getattr(self, "_epoch0_logged", False):
             self.logger.print_logger_head()
 
         # Main training loop
@@ -97,7 +98,7 @@ class BaseTrainer:
                         torch.distributed.barrier()
 
                     if self.rank == 0:
-                        # Update check point 
+                        # Update check point
                         if epoch_loss_valid['loss'] < self.loss_test_min:
                             self.update_check_point(epoch, epoch_loss_train, epoch_loss_valid)
                             self.loss_test_min = epoch_loss_valid['loss']
@@ -109,7 +110,19 @@ class BaseTrainer:
                         # Free GPU memory
                         torch.cuda.empty_cache()
                         gc.collect()
-                        
+
+                    # [OOM mitigation 2026-04-24] epoch-end RAM reclamation on ALL ranks
+                    # Without this, main process RSS grows ~75 KB/step linearly and leads
+                    # to cgroup OOM on long runs (NURION rank 2 OOM, Phase 7b5 runN/O).
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    try:
+                        import ctypes as _ctypes
+                        _ctypes.CDLL("libc.so.6").malloc_trim(0)
+                    except Exception:
+                        pass
+
                     # Update scheduler (learning rate)
                     metrics = None
                     if self.json_data["scheduler"]["scheduler"] == "ReduceLROnPlateau":
@@ -134,13 +147,32 @@ class BaseTrainer:
                     self.l_ckpt_saved = True
 
     def initial_test(self):
-        """Run a preliminary test epoch 
-        and record the initial reference loss (loss_test_min).
+        """Run a preliminary test epoch (epoch 0 baseline, before any training).
+
+        Records initial reference loss (loss_test_min) AND prints the epoch 0
+        loss to the logger so users can verify learning progress by comparing
+        ep0 → ep1 deltas. Without this, the first measured loss is ep1 (after
+        one full pass over the train set) and there is no baseline to compare.
+
+        Train loss is set equal to valid loss as a placeholder (full train-set
+        eval would double the wallclock cost of epoch 0). Only valid loss is
+        physically measured at ep0.
         """
         epoch_loss_test = self.train_one_epoch(mode='test')
         if self.ddp:
             torch.distributed.barrier()
         self.loss_test_min = epoch_loss_test['loss']
+
+        # Print epoch 0 baseline (rank 0 only)
+        if self.rank == 0:
+            self.logger.print_logger_head()
+            # epoch=-1 → print_logger displays "epoch+1+start_epoch = 0"
+            self.print_logger(
+                epoch=-1,
+                epoch_loss_train=epoch_loss_test,   # placeholder (= valid)
+                epoch_loss_valid=epoch_loss_test,
+            )
+            self._epoch0_logged = True
 
     def train_one_epoch(self, mode='train', data_loader=None):
         if mode == 'train':
@@ -264,7 +296,8 @@ class BaseTrainer:
                 self.json_data['regress_forces'],
                 self.json_data.get('max_neigh'),
                 self.rank,
-                self.world_size
+                self.world_size,
+                cache_dir=self.json_data.get('cache_dir'),
             )
         return train_loader, valid_loader, uniq_element, enr_avg_per_element
 
