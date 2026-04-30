@@ -82,6 +82,7 @@ class CDEvaluator(CDTrainer):
             'atomic_charges': [],
             'exact_atomic_charges': [],
             'total_charge': [],
+            'total_multiplicity': [],
             'chi': [],
             'U_CENT': [],
             'E_SR': [],
@@ -129,6 +130,10 @@ class CDEvaluator(CDTrainer):
             if "total_charge" in preds:
                 test_values['total_charge'].append(
                     preds['total_charge'].detach().cpu()
+                )
+            if "total_multiplicity" in data:
+                test_values['total_multiplicity'].append(
+                    data['total_multiplicity'].detach().cpu()
                 )
             if "chi" in preds:
                 test_values['chi'].append(preds['chi'].detach().cpu())
