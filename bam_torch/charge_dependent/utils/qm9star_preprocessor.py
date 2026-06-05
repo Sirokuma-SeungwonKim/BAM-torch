@@ -796,8 +796,24 @@ def parse_and_write_streaming(sql_path, output_path, charge_type="npa_charges",
     return count
 
 
+def _parse_filter_groups(spec):
+    """Parse '(0,1),(0,2),(-1,1),(+1,1)' -> [(0,1), (0,2), (-1,1), (+1,1)]."""
+    matches = re.findall(r'\(\s*([-+]?\d+)\s*,\s*(\d+)\s*\)', spec)
+    if not matches:
+        raise ValueError(
+            f"Could not parse --filter-groups={spec!r}. "
+            f"Expected format: '(0,1),(0,2),(-1,1),(+1,1)'"
+        )
+    return [(int(tc), int(tm)) for tc, tm in matches]
+
+
+def _parse_int_list(spec):
+    """Parse '-1,0,+1' -> [-1, 0, 1]."""
+    return [int(x.strip()) for x in spec.split(',') if x.strip()]
+
+
 def extract_stratified_subset(input_path, output_path, n_samples,
-                              random_seed=42):
+                              random_seed=42, filter_groups=None):
     """Extract a stratified subset from an extended XYZ file.
 
     Groups structures by (total_charge, total_multiplicity) and samples
@@ -809,6 +825,9 @@ def extract_stratified_subset(input_path, output_path, n_samples,
         output_path: output XYZ file
         n_samples: total number of samples to extract
         random_seed: random seed for reproducibility
+        filter_groups: optional list of (total_charge, total_multiplicity)
+            tuples. If given, only molecules in these groups are kept and
+            n_samples is allocated equally across the kept groups.
     """
     # --- Pass 1: scan and index structures ---
     print(f"[Pass 1/2] Scanning {input_path}...")
@@ -843,6 +862,22 @@ def extract_stratified_subset(input_path, output_path, n_samples,
     print(f"  Groups found: {len(groups)}")
     for gk in sorted(groups):
         print(f"    charge={gk[0]:+.0f}, mult={gk[1]}: {len(groups[gk]):,}")
+
+    # --- Optional filter ---
+    if filter_groups is not None:
+        wanted = {(int(c), int(m)) for c, m in filter_groups}
+        groups = {
+            gk: idxs for gk, idxs in groups.items()
+            if (int(round(gk[0])), int(gk[1])) in wanted
+        }
+        if not groups:
+            raise ValueError(
+                f"No molecules match filter_groups={sorted(wanted)}. "
+                f"Check distribution above."
+            )
+        print(f"\n  After filter: {len(groups)} group(s) kept")
+        for gk in sorted(groups):
+            print(f"    charge={gk[0]:+.0f}, mult={gk[1]}: {len(groups[gk]):,}")
 
     # --- Stratified sampling: equal allocation per group ---
     rng = np.random.RandomState(random_seed)
@@ -945,7 +980,36 @@ def main():
         '--seed', type=int, default=42,
         help='Random seed for stratified sampling (default: 42)'
     )
+    parser.add_argument(
+        '--charges', type=str, default=None,
+        help='Orthogonal filter: comma-separated charge list (e.g. "-1,0,+1"). '
+             'Use together with --multiplicities — Cartesian product becomes '
+             'the kept (charge,mult) groups.'
+    )
+    parser.add_argument(
+        '--multiplicities', type=str, default=None,
+        help='Orthogonal filter: comma-separated multiplicity list (e.g. "1,2"). '
+             'Use together with --charges.'
+    )
+    parser.add_argument(
+        '--filter-groups', type=str, default=None,
+        help='Explicit filter: list of (charge,mult) tuples to keep, '
+             'e.g. "(0,1),(0,2),(-1,1),(+1,1)". Overrides --charges/--multiplicities.'
+    )
     args = parser.parse_args()
+
+    # --- Build filter_groups (None = keep all) ---
+    filter_groups = None
+    if args.filter_groups:
+        filter_groups = _parse_filter_groups(args.filter_groups)
+    elif args.charges and args.multiplicities:
+        chs = _parse_int_list(args.charges)
+        mts = _parse_int_list(args.multiplicities)
+        filter_groups = [(c, m) for c in chs for m in mts]
+    elif args.charges or args.multiplicities:
+        print("Error: --charges and --multiplicities must be specified together "
+              "(orthogonal mode), or use --filter-groups for explicit pairs.")
+        sys.exit(1)
 
     # --- Mode: stratified subset extraction ---
     if args.extract_subset:
@@ -956,6 +1020,7 @@ def main():
             args.extract_subset, args.output,
             n_samples=args.max_samples,
             random_seed=args.seed,
+            filter_groups=filter_groups,
         )
         return
 

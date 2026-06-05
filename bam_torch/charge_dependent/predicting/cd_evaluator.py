@@ -84,7 +84,8 @@ class CDEvaluator(CDTrainer):
             'total_charge': [],
             'total_multiplicity': [],
             'chi': [],
-            'U_CENT': [],
+            'U_CEP_SELF': [],
+            'U_CENT': [],         # alias for backward compat (Ver.1 misnomer)
             'E_SR': [],
         }
 
@@ -113,7 +114,12 @@ class CDEvaluator(CDTrainer):
             test_values['force_x'].append(preds['forces'][:, 0].detach().cpu())
             test_values['force_y'].append(preds['forces'][:, 1].detach().cpu())
             test_values['force_z'].append(preds['forces'][:, 2].detach().cpu())
-            test_values['exact_energy'].append(data['energy'].detach().cpu())
+            # FIX (2026-05-29): reconstruct exact to FULL-DFT (+ node_enr_avg) so it is
+            # on the SAME reference as the prediction (line above). CD's predict
+            # dataloader (cd_utils.py:223) stores data['energy'] baseline-removed; appending
+            # it raw left exact ~Sum(enr_avg) below pred -> bogus -10953 eV bias. e_corr is a
+            # pred-side correction and is intentionally NOT added to ground-truth exact.
+            test_values['exact_energy'].append((data['energy'] + node_enr_avg).detach().cpu())
             test_values['exact_force_x'].append(data['forces'][:, 0].detach().cpu())
             test_values['exact_force_y'].append(data['forces'][:, 1].detach().cpu())
             test_values['exact_force_z'].append(data['forces'][:, 2].detach().cpu())
@@ -137,8 +143,9 @@ class CDEvaluator(CDTrainer):
                 )
             if "chi" in preds:
                 test_values['chi'].append(preds['chi'].detach().cpu())
-            if "U_CENT" in preds:
-                test_values['U_CENT'].append(preds['U_CENT'].detach().cpu())
+            if "U_CEP_SELF" in preds:
+                test_values['U_CEP_SELF'].append(preds['U_CEP_SELF'].detach().cpu())
+                test_values['U_CENT'].append(preds['U_CEP_SELF'].detach().cpu())   # alias backward compat
             if "E_SR" in preds:
                 test_values['E_SR'].append(preds['E_SR'].detach().cpu())
 

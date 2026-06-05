@@ -128,7 +128,27 @@ class BaseTrainer:
                     if self.json_data["scheduler"]["scheduler"] == "ReduceLROnPlateau":
                         metrics = epoch_loss_valid['loss']
                     self.scheduler.step(metrics, epoch)
-                
+
+                # [phase8I] Save every epoch (for late refinement / chi-J trajectory analysis)
+                # opt-in via input.json NN.save_every_epoch=true. Default false → no impact on
+                # existing trainings. Saves EMA-shadow params (same as best-valid save path).
+                if self.rank == 0 and self.json_data['NN'].get('save_every_epoch', False):
+                    _current_ep = epoch + 1 + self.start_epoch
+                    _state_dict = (self.model.module.state_dict()
+                                   if self.ddp else self.model.state_dict())
+                    _per_epoch_ckpt = {
+                        'params': _state_dict,
+                        'epoch': _current_ep,
+                        'train_loss': float(epoch_loss_train['loss']),
+                        'valid_loss': float(epoch_loss_valid['loss']),
+                    }
+                    if self.ema is not None:
+                        _per_epoch_ckpt['ema_state'] = self.ema.state_dict()
+                    _per_epoch_fname = self.json_data['NN']['fname_pkl'].replace(
+                        '.pkl', f'_ep{_current_ep:03d}.pkl'
+                    )
+                    torch.save(_per_epoch_ckpt, _per_epoch_fname)
+
                 # Save check point
                 if (epoch+1)%self.json_data['NN']['nsave'] == 0 and not self.l_ckpt_saved:
                     self.ckpt['train_scale_shift'] = {
@@ -145,6 +165,30 @@ class BaseTrainer:
                     torch.save(self.ckpt, self.json_data['NN']['fname_pkl'])
                     # torch.save(self.model, 'model.pt')
                     self.l_ckpt_saved = True
+
+        # Bug fix: final save at end of training loop.
+        # Without this, short runs where nepoch < nsave (e.g. 5-epoch probe with
+        # default nsave=10) never trigger the in-loop save and model.pkl is lost.
+        # Saves the latest ckpt state (which is the most recent best-valid model
+        # if loss kept improving, or whatever last update_check_point produced).
+        if self.rank == 0 and not self.l_ckpt_saved and 'enr_avg_per_element' in self.ckpt:
+            self.ckpt['train_scale_shift'] = {
+                k: (torch.stack(v).mean() if isinstance(v, list) and len(v) > 0
+                    else (v if not isinstance(v, list) else torch.tensor(0.0, device=self.device)))
+                    for k, v in self.ckpt['train_scale_shift'].items()
+            }
+            self.ckpt['valid_scale_shift'] = {
+                k: (torch.stack(v).mean() if isinstance(v, list) and len(v) > 0
+                    else (v if not isinstance(v, list) else torch.tensor(0.0, device=self.device)))
+                    for k, v in self.ckpt['valid_scale_shift'].items()
+            }
+            if isinstance(self.ckpt['valid_scale_shift_origin'], list):
+                self.ckpt['valid_scale_shift_origin'] = torch.tensor(
+                    self.ckpt['valid_scale_shift_origin']
+                ).mean()
+            torch.save(self.ckpt, self.json_data['NN']['fname_pkl'])
+            self.l_ckpt_saved = True
+            print(f"\033[33m[FINAL_SAVE] saved {self.json_data['NN']['fname_pkl']} at end of training loop\033[0m", flush=True)
 
     def initial_test(self):
         """Run a preliminary test epoch (epoch 0 baseline, before any training).
@@ -197,18 +241,25 @@ class BaseTrainer:
                 self.ckpt['valid_scale_shift_origin'] = []
 
         epoch_loss_dict = {key: [] for key in loss_log_config}
+        raw_valid_e_loss_list = []  # bug #20: raw E MSE before scale_shift (valid only)
         for data in data_loader:
             data = self.move_to_device(data, self.device)
             # Predict energy, forces, and so on from model
             preds = self.model(data, backprop)
+
+            # bug #20 mitigation: capture raw E loss before scale_shift target-leak (valid only)
+            if mode == 'valid':
+                raw_e_loss = ((preds['energy'].flatten() - data['energy'].flatten()) ** 2).mean()
+                raw_valid_e_loss_list.append(raw_e_loss.detach().cpu())
+
             preds = self.scale_shift(preds, data, mode)
-            
+
             loss_dict = self.compute_loss(preds, data)
             loss = loss_dict['loss']
             if backprop:
                 self.optimizer.zero_grad()
                 loss.backward()
-                #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5) 
+                #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                 torch.nn.utils.clip_grad_value_(self.model.parameters(), clip_value=0.5)
                 self.optimizer.step()
 
@@ -222,6 +273,17 @@ class BaseTrainer:
         torch.cuda.synchronize()
         epoch_loss_dict = {key: torch.mean(torch.tensor(value)) \
                            for key, value in epoch_loss_dict.items()}
+
+        # bug #20 mitigation: persist epoch-mean raw valid E loss to ckpt + console
+        if mode == 'valid' and raw_valid_e_loss_list:
+            raw_e_mean = torch.mean(torch.tensor(raw_valid_e_loss_list)).item()
+            if 'raw_valid_e_loss' not in self.ckpt:
+                self.ckpt['raw_valid_e_loss'] = []
+            self.ckpt['raw_valid_e_loss'].append(raw_e_mean)
+            print(f"\033[33m[RAW_VALID_E_MSE] {raw_e_mean:.6f}  "
+                  f"(scaled_valid_E_MSE={float(epoch_loss_dict.get('loss_e', torch.nan)):.6f})\033[0m",
+                  flush=True)
+
         return epoch_loss_dict
 
     def scale_shift(self, preds, data, mode):
@@ -377,9 +439,9 @@ class BaseTrainer:
         
         base, ext = os.path.splitext(fname) # "loss_train", ".out"
         count = 2
+        original_fname = fname  # bug fix: capture before mutation for restart branch
         # Make a unique filename
         while os.path.exists(fname): # if exist the file of ```fname``` in this directory
-            old_name = fname
             fname = f"{base}-{count}{ext}"
             count += 1
         # Check this process if restart
@@ -387,8 +449,9 @@ class BaseTrainer:
         model_config = self.json_data['NN']
         restart = model_config.get('restart')
         if restart:
-            fname = old_name
-            base = os.path.splitext(fname)[0]
+            # bug fix: use original fname (always defined) as base for -re suffix.
+            # previously used `old_name` which was undefined when input file didn't exist.
+            base = os.path.splitext(original_fname)[0]
             fname = f"{base}-re{ext}"
             re_count = 2
             while os.path.exists(fname):

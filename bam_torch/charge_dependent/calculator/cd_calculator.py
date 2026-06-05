@@ -222,8 +222,9 @@ class CDRACECalculator(RACECalculator):
             )
         if 'chi' in preds:
             self.results['chi'] = preds['chi'].detach().cpu().numpy()
-        if 'U_CENT' in preds:
-            self.results['U_CENT'] = float(preds['U_CENT'].detach().cpu())
+        if 'U_CEP_SELF' in preds:
+            self.results['U_CEP_SELF'] = float(preds['U_CEP_SELF'].detach().cpu())
+            self.results['U_CENT'] = self.results['U_CEP_SELF']   # alias backward compat
         if 'stress' in preds:
             self.results['stress'] = (
                 preds['stress'][0].detach().cpu().numpy()

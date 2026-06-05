@@ -41,3 +41,10 @@ try:
     TRAINER_REGISTRY["cd_e"] = CDTrainerV3
 except ImportError:
     pass
+
+try:
+    from bam_torch.charge_dependent.v2.training.cd_trainer_v4 import CDTrainerV4
+    TRAINER_REGISTRY["cd_v4"] = CDTrainerV4
+    TRAINER_REGISTRY["charge_dependent_v4"] = CDTrainerV4
+except ImportError:
+    pass

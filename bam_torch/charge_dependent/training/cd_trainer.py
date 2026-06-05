@@ -18,6 +18,7 @@ from bam_torch.training.base_trainer import BaseTrainer
 from bam_torch.model.wrapper_ops import CuEquivarianceConfig
 from bam_torch.charge_dependent.model import MODEL_REGISTRY
 from bam_torch.charge_dependent.utils.cd_utils import get_dataloader_charge
+from bam_torch.charge_dependent.training.mtl import UncertaintyWeighter
 
 
 class CDTrainer(BaseTrainer):
@@ -37,6 +38,36 @@ class CDTrainer(BaseTrainer):
 
     def __init__(self, json_data, rank=0, world_size=1):
         super().__init__(json_data, rank, world_size)
+
+    def _mtl_method(self):
+        """Multi-task loss-weighting method: 'none' (default) | 'uncertainty'."""
+        return str(self.json_data.get('NN', {}).get('mtl_weighting', 'none')).lower()
+
+    def configure_optimizer(self):
+        """Build the base optimizer, then (opt-in) attach a learnable multi-task
+        loss weighter as an extra param group.
+
+        Enabled by ``NN.mtl_weighting == 'uncertainty'``. The default ('none') creates
+        no weighter and leaves the optimizer untouched, reproducing the fixed-lambda
+        behavior exactly. The weighter's log-variances are optimized with the base lr.
+
+        NOTE: the weighter lives on the trainer (not the model), so it is intentionally
+        NOT tracked by EMA and NOT saved in the model checkpoint; a restart re-initializes
+        it to unit weights. This is acceptable for fresh (restart=false) ablation runs.
+        """
+        self.mtl_weighter = None
+        if self._mtl_method() == 'uncertainty':
+            self.mtl_weighter = UncertaintyWeighter(("e", "f", "q")).to(self.device)
+        optimizer = super().configure_optimizer()
+        if self.mtl_weighter is not None:
+            optimizer.add_param_group(
+                {'params': list(self.mtl_weighter.parameters())}
+            )
+            if getattr(self, 'rank', 0) == 0:
+                print(f"[MTL] uncertainty weighting enabled "
+                      f"(learnable log-vars over {self.mtl_weighter.task_keys})",
+                      flush=True)
+        return optimizer
 
     def set_model(self):
         """Configure ChargeRACE Phase 2 (CEP) model."""
@@ -166,6 +197,21 @@ class CDTrainer(BaseTrainer):
 
             loss["loss_q"] = loss_q
             loss["loss"]   = loss["loss"] + q_lambda * loss_q
+
+        # Opt-in: replace the fixed-lambda total with learned uncertainty weighting.
+        # (Per-task loss_e/loss_f/loss_q dict entries are left raw for logging.)
+        weighter = getattr(self, "mtl_weighter", None)
+        if weighter is not None:
+            weighted = weighter({
+                "e": loss.get("loss_e"),
+                "f": loss.get("loss_f"),
+                "q": loss.get("loss_q"),
+            })
+            # keep any non-task regularizer (e.g. L2) at its fixed weight
+            l2_lambda = self.json_data.get("NN", {}).get("l2_lambda", 0)
+            if l2_lambda and "loss_l2" in loss:
+                weighted = weighted + l2_lambda * loss["loss_l2"]
+            loss["loss"] = weighted
 
         return loss
 

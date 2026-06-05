@@ -318,10 +318,18 @@ class ChargeRACEv3(torch.nn.Module):
 
         if "total_charge" in data:
             total_charge = data["total_charge"].float()
+            import os as _os
+            if _os.environ.get('_CEP_DEBUG') and not _os.environ.get('_CEP_DEBUG_PRINTED'):
+                print(f"[DEBUG] total_charge IN data: shape={tuple(total_charge.shape)} vals={total_charge[:5].tolist()} num_graphs={num_graphs}", flush=True)
+                _os.environ['_CEP_DEBUG_PRINTED'] = '1'
         else:
             total_charge = torch.zeros(
                 num_graphs, dtype=torch.float32, device=E_SR.device
             )
+            import os as _os
+            if _os.environ.get('_CEP_DEBUG') and not _os.environ.get('_CEP_DEBUG_PRINTED'):
+                print(f"[DEBUG] total_charge NOT in data → zeros fallback! num_graphs={num_graphs}", flush=True)
+                _os.environ['_CEP_DEBUG_PRINTED'] = '1'
 
         cep_out = self.cep(
             node_feats=last_node_feats,
@@ -332,10 +340,12 @@ class ChargeRACEv3(torch.nn.Module):
         )
 
         # ── E_total determination ─────────────────────────────────────────
-        # Phase 3 (E): E_total = E_SR (U_CENT contribution removed)
+        # Phase 3 (E): E_total = E_SR (U_CEP_SELF contribution removed)
         # use_cent_energy=True reverts to Phase 2 behavior (backward compat)
+        # NOTE (Ver.1, 2026-05-21): cep_out["U_CEP_SELF"] is the renamed key.
+        # cep_out["U_CENT"] still works (alias for backward compat).
         if self.use_cent_energy:
-            graph_energy = E_SR + cep_out["U_CENT"]
+            graph_energy = E_SR + cep_out["U_CEP_SELF"]
         else:
             graph_energy = E_SR
 
@@ -345,7 +355,8 @@ class ChargeRACEv3(torch.nn.Module):
         preds["atomic_charges"] = cep_out["atomic_charges"]
         preds["total_charge"] = cep_out["total_charge"]
         preds["chi"] = cep_out["chi"]
-        preds["U_CENT"] = cep_out["U_CENT"]
+        preds["U_CEP_SELF"] = cep_out["U_CEP_SELF"]
+        preds["U_CENT"] = cep_out["U_CEP_SELF"]   # alias for backward compat (Ver.1 misnomer)
         preds["E_SR"] = E_SR
 
         # ── Forces ────────────────────────────────────────────────────────

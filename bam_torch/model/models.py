@@ -248,14 +248,6 @@ class RACE(torch.nn.Module):
             node_energies = readout(node_feats) # [n_nodes, len(heads)]  == [nbatch*num_nodes, "1x0e" or "2x0e"]
 
             if "direct" in self.regress_forces:
-                l_0_dim = 0
-                l_1_dim = 0
-                for mul, (l, p) in self.hidden_irreps:
-                    if str(l) == "0":
-                        l_0_dim += mul
-                    elif str(l) == "1":
-                        l_1_dim += mul
-
                 node_force_dir = force_decoder(node_feats)
                 node_forces = node_force_dir
                 frc_out.append(node_forces)
@@ -356,8 +348,8 @@ class RACE(torch.nn.Module):
             node_force = self.act_fn(node_force)
             forces = torch.sum(node_force, dim=-1) # [nbatch*num_nodes]  # total_energy
             system_means = scatter_mean(forces, data["batch"], dim=0)
-            node_boradcasteds_means = system_means[data["batch"]]
-            forces = forces - node_boradcasteds_means
+            node_broadcasted_means = system_means[data["batch"]]
+            forces = forces - node_broadcasted_means
             forces = remove_net_torque(data["positions"], forces, data["batch"])
 
             node_stress = torch.stack(sts_out, dim=-1) # [nbatch*num_nodes, 6, nlayers]

@@ -67,8 +67,15 @@ class CDEvaluatorV3(CDTrainerV3):
         self.log_config, self.log_interval, self.logger, self.fout = \
             self.configure_logger()
 
-    def evaluate(self, element_wise=True):
-        """Run model evaluation. Collects Phase 3 CEP results."""
+    def evaluate(self, element_wise=False):
+        """Run model evaluation. Collects Phase 3 CEP results.
+
+        Phase 8D (bug #20): default e_corr mode changed from element-wise sum
+        to origin scalar (`valid_scale_shift_origin`). Both yield same per-sample
+        std but origin scalar applies a constant offset (no per-sample noise),
+        making predictions easier to interpret. Set element_wise=True to recover
+        prior behavior.
+        """
         self.logger.print_logger_head()
         eval_loss_dict = {
             'loss': [], 'loss_e': [], 'loss_f': [], 'loss_q': [],
@@ -86,7 +93,8 @@ class CDEvaluatorV3(CDTrainerV3):
             'total_charge': [],
             'total_multiplicity': [],
             'chi': [],
-            'U_CENT': [],
+            'U_CEP_SELF': [],
+            'U_CENT': [],            # alias for backward compat (Ver.1 misnomer, see cep_block.py)
             'E_SR': [],
         }
 
@@ -115,7 +123,13 @@ class CDEvaluatorV3(CDTrainerV3):
             test_values['force_x'].append(preds['forces'][:, 0].detach().cpu())
             test_values['force_y'].append(preds['forces'][:, 1].detach().cpu())
             test_values['force_z'].append(preds['forces'][:, 2].detach().cpu())
-            test_values['exact_energy'].append(data['energy'].detach().cpu())
+            # FIX (2026-05-29): reconstruct exact to FULL-DFT (+ node_enr_avg) so it
+            # is on the SAME reference as the prediction (line above). The CD predict
+            # dataloader (cd_utils.py:223) stores data['energy'] baseline-removed, so
+            # appending it raw left exact ~Sum(enr_avg) (~1e4 eV) below pred -> bogus
+            # -10953 eV bias in test_values. e_corr is a pred-side correction and is
+            # intentionally NOT added to the ground-truth exact (matches base evaluator).
+            test_values['exact_energy'].append((data['energy'] + node_enr_avg).detach().cpu())
             test_values['exact_force_x'].append(data['forces'][:, 0].detach().cpu())
             test_values['exact_force_y'].append(data['forces'][:, 1].detach().cpu())
             test_values['exact_force_z'].append(data['forces'][:, 2].detach().cpu())
@@ -139,8 +153,9 @@ class CDEvaluatorV3(CDTrainerV3):
                 )
             if "chi" in preds:
                 test_values['chi'].append(preds['chi'].detach().cpu())
-            if "U_CENT" in preds:
-                test_values['U_CENT'].append(preds['U_CENT'].detach().cpu())
+            if "U_CEP_SELF" in preds:
+                test_values['U_CEP_SELF'].append(preds['U_CEP_SELF'].detach().cpu())
+                test_values['U_CENT'].append(preds['U_CEP_SELF'].detach().cpu())   # alias backward compat
             if "E_SR" in preds:
                 test_values['E_SR'].append(preds['E_SR'].detach().cpu())
 

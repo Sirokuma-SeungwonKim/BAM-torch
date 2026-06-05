@@ -21,6 +21,10 @@ def _register_charge_dependent():
         MODEL_REGISTRY["charge_race_v3"] = ChargeRACEv3
         MODEL_REGISTRY["cd_race_v3"] = ChargeRACEv3
         MODEL_REGISTRY["charge_race_e"] = ChargeRACEv3
+    if "charge_race_v4" not in MODEL_REGISTRY:
+        from bam_torch.charge_dependent.v2.model.cd_model_v4 import ChargeRACEv4
+        MODEL_REGISTRY["charge_race_v4"] = ChargeRACEv4
+        MODEL_REGISTRY["cd_race_v4"] = ChargeRACEv4
 
 
 # Register on first access via try/except so it works even if
