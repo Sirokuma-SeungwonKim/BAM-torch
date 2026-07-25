@@ -181,6 +181,57 @@ def _extract_charges(atoms, charge_key="charges",
     return atomic_charges, total_charge, total_multiplicity
 
 
+def _extract_observables(atoms):
+    """Extract per-structure electrostatic observables (dipole, quadrupole).
+
+    Optional supervision targets (AIMNet2 P1 / gauge-depth). Absent targets are
+    returned as zeros together with a presence flag so a downstream loss can mask
+    them out — a stored zero must never be trained on as if it were real.
+
+    Sources handled:
+      - dipole:     info['dipole'] (3-vector)  OR  info['dipole_x/y/z']  (QM9star)
+      - quadrupole: info['quadrupole'] (6-vector: xx,yy,zz,xy,xz,yz — AIMNet2 order)
+                    or a full 3x3 (9) collapsed to the 6 unique components.
+
+    Returns:
+        dipole:     np.ndarray [3]   (zeros if absent)
+        quadrupole: np.ndarray [6]   (zeros if absent)
+        has_dipole:     float 1.0/0.0
+        has_quadrupole: float 1.0/0.0
+    """
+    info = atoms.info
+
+    # --- dipole ---
+    dipole = None
+    if 'dipole' in info:
+        v = np.asarray(info['dipole'], dtype=float).ravel()
+        if v.size == 3:
+            dipole = v
+    if dipole is None and all(f'dipole_{ax}' in info for ax in 'xyz'):
+        dipole = np.array([float(info['dipole_x']),
+                           float(info['dipole_y']),
+                           float(info['dipole_z'])])
+    has_dipole = dipole is not None
+    if dipole is None:
+        dipole = np.zeros(3)
+
+    # --- quadrupole (6 unique components) ---
+    quad = None
+    if 'quadrupole' in info:
+        v = np.asarray(info['quadrupole'], dtype=float).ravel()
+        if v.size == 6:
+            quad = v
+        elif v.size == 9:  # full 3x3 -> [xx,yy,zz,xy,xz,yz]
+            m = v.reshape(3, 3)
+            quad = np.array([m[0, 0], m[1, 1], m[2, 2],
+                             m[0, 1], m[0, 2], m[1, 2]])
+    has_quadrupole = quad is not None
+    if quad is None:
+        quad = np.zeros(6)
+
+    return dipole, quad, float(has_dipole), float(has_quadrupole)
+
+
 def get_graphset_charge(
     data, cutoff, uniq_element, enr_avg_per_element,
     enr_var, regress_forces=True, max_neigh=None,
@@ -268,6 +319,11 @@ def get_graphset_charge(
             atoms, charge_key, total_charge_key
         )
 
+        # Extract optional observable targets (dipole/quadrupole) + masks
+        dipole, quadrupole, has_dipole, has_quadrupole = _extract_observables(
+            atoms
+        )
+
         # Create PyG Data object
         graph = Data(
             positions=torch.tensor(crds, dtype=torch.float32),
@@ -295,6 +351,12 @@ def get_graphset_charge(
             total_multiplicity=torch.tensor(
                 total_multiplicity, dtype=torch.long
             ),
+            # Optional observable targets (graph-level; mirror `cell`'s (1,...)
+            # leading dim so PyG batches them to (B,3)/(B,6)). has_* = mask.
+            dipole=torch.tensor(dipole, dtype=torch.float32).view(1, 3),
+            quadrupole=torch.tensor(quadrupole, dtype=torch.float32).view(1, 6),
+            has_dipole=torch.tensor([has_dipole], dtype=torch.float32),
+            has_quadrupole=torch.tensor([has_quadrupole], dtype=torch.float32),
         )
         graph_list.append(graph)
 

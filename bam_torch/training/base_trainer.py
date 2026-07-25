@@ -63,10 +63,30 @@ class BaseTrainer:
         self.log_config, self.log_interval, self.logger = self.configure_logger()
         self.loss_dict, self.ckpt = self.configure_checkpoint()
         self.ema = self.configure_exponential_moving_average()
-    
+
+        # [resume] After every component exists (optimizer/scheduler/ema/subclass
+        # extras like the MTL weighter), restore their state from a resume
+        # checkpoint if this is a resumed run. No-op for fresh runs.
+        self.restore_resume_state()
+
     def train(self):
         """Main training loop for BAM models.
         """
+        # [max_total_epoch] Optional hard cap on the CUMULATIVE epoch count across
+        # resumes. ``nepoch`` is per-run (a resumed job runs ``nepoch`` MORE epochs),
+        # so a 12h-cut requeue chain would otherwise overshoot / stop at an uneven
+        # epoch per group. When set, training stops at exactly this cumulative epoch,
+        # giving matched epoch budgets across runs and across G1-G4 groups. Unset
+        # (default) => no cap, existing behavior unchanged.
+        max_total = self.json_data['NN'].get('max_total_epoch')
+        max_total = int(max_total) if max_total is not None else None
+        if max_total is not None and self.start_epoch >= max_total:
+            if self.rank == 0:
+                print(f"\033[32m[DONE] start_epoch {self.start_epoch} >= "
+                      f"max_total_epoch {max_total}: training already complete, "
+                      f"exiting without doing any work.\033[0m", flush=True)
+            return
+
         # Initial test (epoch 0 baseline, prints logger head + ep0 loss line)
         self.initial_test()
 
@@ -78,6 +98,14 @@ class BaseTrainer:
         # Main training loop
         nepoch = self.json_data['NN']['nepoch']
         for epoch in range(nepoch):
+            # [max_total_epoch] Stop once the CUMULATIVE epoch reaches the cap. This
+            # iteration would produce cumulative epoch (epoch+1+start_epoch); break
+            # before running it once that would exceed max_total.
+            if max_total is not None and (epoch + self.start_epoch) >= max_total:
+                if self.rank == 0:
+                    print(f"\033[32m[DONE] reached max_total_epoch {max_total}; "
+                          f"stopping training.\033[0m", flush=True)
+                break
             try:
                 self.model.update_criterion_value(epoch+self.start_epoch+1)
             except:
@@ -96,6 +124,9 @@ class BaseTrainer:
                     epoch_loss_valid = self.train_one_epoch(mode='valid')
                     if self.ddp:
                         torch.distributed.barrier()
+                    # [resume] remember most recent valid loss for the rolling
+                    # resume checkpoint (valid only runs every log_interval).
+                    self._last_valid_loss = float(epoch_loss_valid['loss'])
 
                     if self.rank == 0:
                         # Update check point
@@ -165,6 +196,14 @@ class BaseTrainer:
                     torch.save(self.ckpt, self.json_data['NN']['fname_pkl'])
                     # torch.save(self.model, 'model.pt')
                     self.l_ckpt_saved = True
+
+            # [resume] rolling full-state checkpoint (opt-in NN.resume_autosave).
+            # Placed OUTSIDE the EMA param_context above, so RAW training params are
+            # saved (the EMA shadow is stored separately). Written atomically every
+            # epoch (or every NN.resume_every_min minutes) so a 12h wall-clock cut or
+            # a hang can resume from the most recent epoch with optimizer / scheduler /
+            # EMA / MTL-weighter state intact.
+            self.save_resume_checkpoint(epoch, epoch_loss_train)
 
         # Bug fix: final save at end of training loop.
         # Without this, short runs where nepoch < nsave (e.g. 5-epoch probe with
@@ -329,7 +368,141 @@ class BaseTrainer:
             'loss': self.loss_dict,
             'ema_state': ema_state
         })
-    
+
+    # ------------------------------------------------------------------ #
+    # Resume system (opt-in via NN.resume_autosave)                       #
+    #                                                                     #
+    # Survives 12h wall-clock cuts and hangs: a rolling full-state        #
+    # checkpoint is written atomically every epoch (or every             #
+    # NN.resume_every_min minutes), and a restart restores optimizer /    #
+    # scheduler / EMA / RNG / subclass extras (e.g. the MTL weighter) so  #
+    # training continues from the most recent epoch, not from the last    #
+    # best-valid checkpoint. Fully opt-in; default off => no behavior     #
+    # change to existing runs.                                            #
+    # ------------------------------------------------------------------ #
+    def _resume_ckpt_path(self):
+        """Path of the rolling resume checkpoint (default derived from fname_pkl)."""
+        cfg = self.json_data['NN']
+        p = cfg.get('resume_ckpt')
+        if p:
+            return p
+        root, ext = os.path.splitext(cfg['fname_pkl'])
+        return root + '.resume' + (ext or '.pkl')
+
+    def _collect_extra_resume_state(self):
+        """Hook: subclasses return extra state to persist in the resume
+        checkpoint (e.g. CDTrainer adds the MTL Kendall weighter). Base: none."""
+        return {}
+
+    def _restore_extra_resume_state(self, ckpt):
+        """Hook: subclasses restore their extra state from the resume checkpoint.
+        Base: nothing."""
+        pass
+
+    def save_resume_checkpoint(self, epoch, epoch_loss_train):
+        """Atomically write the rolling full-state resume checkpoint (rank 0 only).
+
+        Opt-in via ``NN.resume_autosave``. Captures everything needed to resume
+        training exactly: raw model params, optimizer moments, scheduler position,
+        EMA shadow, RNG states, and any subclass extras (e.g. the MTL weighter's
+        learned log-variances). Throttled by ``NN.resume_every_min`` (wall-clock
+        minutes) if set, otherwise saved every epoch.
+
+        The write is atomic (temp file + ``os.replace``) so a kill or 12h cut mid-write
+        never leaves a corrupt resume file — the previous good checkpoint stays intact.
+        """
+        if getattr(self, 'rank', 0) != 0:
+            return
+        cfg = self.json_data['NN']
+        if not cfg.get('resume_autosave'):
+            return
+
+        every_min = cfg.get('resume_every_min')
+        now = time()
+        if every_min:
+            last = getattr(self, '_last_resume_save_t', None)
+            if last is not None and (now - last) < float(every_min) * 60.0:
+                return
+
+        disp_epoch = epoch + 1 + self.start_epoch
+        model = self.model.module if self.ddp else self.model
+        ckpt = {
+            '_bam_resume': True,
+            'params': model.state_dict(),
+            'opt_state': self.optimizer.state_dict(),
+            'scheduler': (self.scheduler.state_dict()
+                          if self.scheduler is not None else None),
+            'ema_state': (self.ema.state_dict() if self.ema is not None else None),
+            'epoch': disp_epoch,
+            'loss': {
+                'epoch': disp_epoch,
+                'train': float(epoch_loss_train['loss']),
+                'valid': float(getattr(self, '_last_valid_loss',
+                                       epoch_loss_train['loss'])),
+            },
+            'input.json': self.json_data,
+            'rng': {
+                'torch': torch.get_rng_state(),
+                'cuda': (torch.cuda.get_rng_state_all()
+                         if torch.cuda.is_available() else None),
+                'numpy': np.random.get_state(),
+                'python': random.getstate(),
+            },
+        }
+        ckpt.update(self._collect_extra_resume_state())
+
+        path = self._resume_ckpt_path()
+        tmp = path + '.tmp'
+        torch.save(ckpt, tmp)
+        os.replace(tmp, path)   # atomic swap: no half-written resume file
+        self._last_resume_save_t = now
+
+        interval = max(1, int(getattr(self, 'log_interval', 1)))
+        if disp_epoch % interval == 0:
+            print(f"\033[36m[RESUME_SAVE] epoch {disp_epoch} -> {path}\033[0m",
+                  flush=True)
+
+    def restore_resume_state(self):
+        """After setup(), restore the pieces the base ``configure_*`` methods do NOT
+        already handle on restart: the RNG state and subclass extras (e.g. the MTL
+        Kendall weighter).
+
+        On any restart the base already restores model params (``configure_model``),
+        optimizer moments (``configure_optimizer``), scheduler position
+        (``configure_scheduler``) and the EMA shadow
+        (``configure_exponential_moving_average``). This method only fills the
+        remaining gaps, and only for a resumed run whose loaded checkpoint carries the
+        ``_bam_resume`` marker (written by ``save_resume_checkpoint``).
+        """
+        if not self.json_data['NN'].get('restart'):
+            return
+        ck = getattr(self, 'model_ckpt', None)
+        if not ck or not ck.get('_bam_resume'):
+            return
+
+        restored = []
+        rng = ck.get('rng')
+        if rng:
+            try:
+                torch.set_rng_state(rng['torch'].cpu().to(torch.uint8))
+                if rng.get('cuda') is not None and torch.cuda.is_available():
+                    torch.cuda.set_rng_state_all(
+                        [s.cpu().to(torch.uint8) for s in rng['cuda']])
+                np.random.set_state(rng['numpy'])
+                random.setstate(rng['python'])
+                restored.append('rng')
+            except Exception as e:
+                print(f"\033[33m[RESUME] rng not restored: {e}\033[0m", flush=True)
+
+        # Subclass extras (e.g. the MTL Kendall weighter's learned log-vars).
+        self._restore_extra_resume_state(ck)
+
+        if getattr(self, 'rank', 0) == 0:
+            extra = ', '.join(restored) if restored else 'none'
+            print(f"\033[32m[RESUME] continuing from epoch {ck.get('epoch')} "
+                  f"(model/opt/scheduler/ema restored by base; extra: {extra})\033[0m",
+                  flush=True)
+
     def print_logger(self, epoch, epoch_loss_train, epoch_loss_valid):
         # Get the last learning rate
         lr = self.scheduler.get_lr() \
@@ -607,7 +780,22 @@ class BaseTrainer:
 
         model_config = self.json_data['NN']
         restart = model_config.get('restart')
-        
+
+        # [resume] Auto-detect a rolling resume checkpoint. When resume_autosave is on
+        # and a resume file already exists, continue from it even if restart was not
+        # explicitly set -- so a SLURM 12h requeue can re-run the SAME input.json and
+        # transparently pick up where it left off. Mutating restart here (before
+        # configure_logger runs) keeps the logger's restart-aware naming consistent.
+        self._bam_resumed = False
+        if (model_config.get('resume_autosave')
+                and model_config.get('resume_autodetect', True)
+                and not restart
+                and os.path.exists(self._resume_ckpt_path())):
+            restart = True
+            model_config['restart'] = True
+            self.msg += (f'\n\033[36m[RESUME] auto-detected {self._resume_ckpt_path()} '
+                         f'-> resuming (restart implied)\033[0m\n')
+
         evaluate_config = self.json_data['predict']
         evaluate = evaluate_config.get('evaluate_tag')  # True or False(None)
 
@@ -615,11 +803,19 @@ class BaseTrainer:
             rank = self.rank
             evaluate = False
             self.json_data['predict']['evaluate_tag'] = False
+            # Prefer the rolling resume checkpoint (most recent epoch) over the
+            # best-valid fname_pkl when the resume system is enabled.
+            ckpt_path = model_config["fname_pkl"]
+            if model_config.get('resume_autosave'):
+                _rp = self._resume_ckpt_path()
+                if os.path.exists(_rp):
+                    ckpt_path = _rp
             model_ckpt = torch.load(
-                model_config["fname_pkl"],
-                map_location=self.device, 
+                ckpt_path,
+                map_location=self.device,
                 weights_only=False
             )
+            self._bam_resumed = bool(model_ckpt.get('_bam_resume'))
             start_epoch = model_ckpt['loss']['epoch']
             try:
                 model.load_state_dict(model_ckpt['params'])

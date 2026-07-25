@@ -247,10 +247,27 @@ def _scan_max_padding(shard_files, cache_dir):
 
     Peak RAM = 1 shard (same as ShardedDataset).  Required to determine
     uniform padding for Base RACE's fixed-size forward pass.
+
+    Logs each shard (index, name, size) BEFORE the torch.load and again AFTER,
+    with elapsed time, flushed line-by-line. If a load stalls on a shared
+    filesystem the last "loading ..." line pinpoints the exact shard (an
+    in-place progress bar cannot — it only shows a frozen percentage). Prefer
+    avoiding this path: build_cache.py now stores padding in the manifest, and
+    precompute_padding.py can build the cache out-of-band on a CPU node.
     """
+    import time
     max_nodes = max_edges = 0
-    for fname, _ in tqdm(shard_files, desc="[Base] Scanning padding", leave=False):
-        shard = torch.load(os.path.join(cache_dir, fname), weights_only=False)
+    n = len(shard_files)
+    for i, (fname, _) in enumerate(shard_files):
+        path = os.path.join(cache_dir, fname)
+        try:
+            mb = os.path.getsize(path) / 1e6
+        except OSError:
+            mb = -1.0
+        print(f"[Base] scan {i + 1}/{n} loading {fname} ({mb:.0f} MB)...",
+              flush=True)
+        t0 = time.time()
+        shard = torch.load(path, weights_only=False)
         for g in shard:
             if g.num_nodes > max_nodes:
                 max_nodes = g.num_nodes
@@ -258,7 +275,10 @@ def _scan_max_padding(shard_files, cache_dir):
                 max_edges = g.num_edges
         del shard
         gc.collect()
-    return max_nodes, max_edges
+        print(f"[Base] scan {i + 1}/{n} done {fname} "
+              f"({time.time() - t0:.1f}s; running max nodes={max_nodes} "
+              f"edges={max_edges})", flush=True)
+    return int(max_nodes), int(max_edges)
 
 
 class PaddedShardedDataset(torch.utils.data.IterableDataset):
@@ -389,17 +409,32 @@ def get_dataloader(fname, ntrain, nvalid,
             my_valid_shards = all_valid_shards[
                 rank * n_valid_per_rank:(rank + 1) * n_valid_per_rank]
 
-            # Rank 0: scan for global padding (peak RAM = 1 shard ≈ 11 GB)
-            # Result cached to disk so subsequent runs skip the scan.
+            # Padding resolution, cheapest source first:
+            #   1. manifest['pad_nodes'/'pad_edges'] — precomputed at build time,
+            #      instant, no shard I/O; every rank reads it independently.
+            #   2. _base_padding.pt                  — a prior scan's cached result.
+            #   3. full shard scan                   — last resort. This is the
+            #      ~17 min (or, if a shard stalls on a shared FS, indefinite) hang;
+            #      rebuild the cache with the current build_cache.py, or run
+            #      precompute_padding.py, to avoid it entirely.
             _pad_path = os.path.join(cache_dir, '_base_padding.pt')
-            if rank == 0:
+            _m_pn, _m_pe = manifest.get('pad_nodes'), manifest.get('pad_edges')
+            if _m_pn is not None and _m_pe is not None:
+                pad_nodes, pad_edges = int(_m_pn), int(_m_pe)
+                if rank == 0:
+                    print(f"\033[32m[Base] Padding (from manifest): "
+                          f"max_nodes={pad_nodes}, max_edges={pad_edges}\033[0m")
+                # every rank has the manifest -> no cross-rank file sync needed
+            elif rank == 0:
                 if os.path.exists(_pad_path):
                     _pd = torch.load(_pad_path, weights_only=False)
                     pad_nodes, pad_edges = _pd['pad_nodes'], _pd['pad_edges']
                     print(f"\033[32m[Base] Padding (cached): "
                           f"max_nodes={pad_nodes}, max_edges={pad_edges}\033[0m")
                 else:
-                    print(f"\033[32m[Base] Scanning shards for padding...\033[0m")
+                    print(f"\033[33m[Base] No padding in manifest — scanning shards "
+                          f"(one-time, slow on shared FS). Rebuild the cache with the "
+                          f"current build_cache.py to skip this.\033[0m")
                     pad_nodes, pad_edges = _scan_max_padding(
                         all_train_shards + all_valid_shards, cache_dir)
                     torch.save({'pad_nodes': pad_nodes,
@@ -427,13 +462,17 @@ def get_dataloader(fname, ntrain, nvalid,
                 my_valid_shards, cache_dir, pad_nodes, pad_edges,
                 shuffle=False, seed=random_seed)
 
+            # Honor BAM_NUM_WORKERS / BAM_PIN_MEMORY (RSS-leak mitigation on long
+            # 2M-scale runs), matching the CD loader. Defaults keep prior behavior.
+            _nw = int(os.environ.get("BAM_NUM_WORKERS", "2"))
+            _pm = os.environ.get("BAM_PIN_MEMORY", "1") == "1"
             train_loader = DataLoader(
                 train_dataset, batch_size=nbatch,
-                num_workers=2, pin_memory=True,
-                drop_last=True, persistent_workers=True)
+                num_workers=_nw, pin_memory=_pm,
+                drop_last=True, persistent_workers=(_nw > 0))
             valid_loader = DataLoader(
                 valid_dataset, batch_size=nbatch,
-                num_workers=0, pin_memory=True, drop_last=False)
+                num_workers=0, pin_memory=_pm, drop_last=False)
             return train_loader, valid_loader, uniq_element, enr_avg_per_element
 
     # For DDP with integer ntrain/nvalid, use rank-0 caching

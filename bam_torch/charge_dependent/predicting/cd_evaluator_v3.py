@@ -96,6 +96,9 @@ class CDEvaluatorV3(CDTrainerV3):
             'U_CEP_SELF': [],
             'U_CENT': [],            # alias for backward compat (Ver.1 misnomer, see cep_block.py)
             'E_SR': [],
+            'dipole': [],            # μ_pred (B,3) in e·Å  (point-charge model)
+            'exact_dipole': [],      # DFT dipole (B,3) in Debye (QM9star dipole_x/y/z)
+            'has_dipole': [],        # per-molecule mask (1.0 if DFT dipole present)
         }
 
         target = {}
@@ -158,6 +161,19 @@ class CDEvaluatorV3(CDTrainerV3):
                 test_values['U_CENT'].append(preds['U_CEP_SELF'].detach().cpu())   # alias backward compat
             if "E_SR" in preds:
                 test_values['E_SR'].append(preds['E_SR'].detach().cpu())
+            # Dipole: μ_pred (e·Å) + DFT target (Debye) + presence mask.
+            if preds.get("dipole") is not None:
+                test_values['dipole'].append(preds['dipole'].detach().cpu())
+            if "dipole" in data:
+                _ed = data['dipole'].view(-1, 3).detach().cpu()
+                test_values['exact_dipole'].append(_ed)
+                # Always append a matching-length mask so exact_dipole and has_dipole
+                # stay index-aligned (default 1.0 if the pipeline omitted has_dipole).
+                if "has_dipole" in data:
+                    test_values['has_dipole'].append(
+                        data['has_dipole'].view(-1).detach().cpu())
+                else:
+                    test_values['has_dipole'].append(torch.ones(_ed.shape[0]))
 
             loss_dict = self.compute_loss(preds, data)
 
@@ -197,6 +213,59 @@ class CDEvaluatorV3(CDTrainerV3):
                 line = f"MEAN_LOSS({tag}): {val:<11.5g}"
                 print(line, file=self.fout)
                 print(line)
+
+        # ── Dipole capability (scheme-free): |μ_pred|·4.803[D] vs |μ_DFT|[D] ──
+        # MAGNITUDE only — the stored DFT dipole VECTOR is in a different orientation
+        # frame than the coordinates, so component-wise comparison is invalid; |μ| is
+        # rotation-invariant. STRATIFIED by charge state:
+        #   • NEUTRAL (Q≈0): |μ| is origin-free → trustworthy (this is the clean metric).
+        #   • CHARGED (Q≠0): |μ| is reference-dependent AND the DFT gauge origin is
+        #     unknown → reported but flagged UNRELIABLE (do not compare to DFT).
+        # Point-charge floor: |μ_pred| from point charges has an irreducible ceiling
+        # (R²≈0.66 for NPA on QM9) → use R²/slope, NOT absolute MAE, never across schemes.
+        if test_values['dipole'] and test_values['exact_dipole']:
+            import numpy as _np
+            _EA2D = 4.80320
+            _mp = torch.cat(test_values['dipole']).numpy()          # (M,3) e·Å
+            _mt = torch.cat(test_values['exact_dipole']).numpy()    # (M,3) Debye
+            _magp = _np.linalg.norm(_mp, axis=1) * _EA2D            # Debye
+            _magt = _np.linalg.norm(_mt, axis=1)                    # Debye
+            _M = min(len(_magp), len(_magt))
+            _magp, _magt = _magp[:_M], _magt[:_M]
+            _hd = (torch.cat(test_values['has_dipole']).numpy()[:_M] > 0.5
+                   if test_values['has_dipole'] else _np.ones(_M, dtype=bool))
+            _Q = (torch.cat(test_values['total_charge']).numpy().reshape(-1)[:_M]
+                  if test_values['total_charge'] else _np.zeros(_M))
+
+            def _metric(sel):
+                p, t = _magp[sel], _magt[sel]
+                if len(t) < 3 or float(_np.std(t)) < 1e-6:
+                    return None
+                ssr = float(_np.sum((p - t) ** 2))
+                sst = float(_np.sum((t - t.mean()) ** 2))
+                return {'N': int(len(t)), 'mag_R2': 1.0 - ssr / sst,
+                        'mag_RMSE_D': float(_np.sqrt(_np.mean((p - t) ** 2))),
+                        'mag_slope': float(_np.polyfit(t, p, 1)[0])}
+
+            _neu = _hd & (_np.abs(_Q) < 0.5)
+            _chg = _hd & (_np.abs(_Q) >= 0.5)
+            test_values['dipole_metrics'] = {
+                'note': ('|mu| MAGNITUDE only (DFT dipole VECTOR frame-mismatched); '
+                         'point-charge floor R2~0.66 -> use R2/slope NOT absolute MAE; '
+                         'CHARGED |mu| is reference-dependent = NOT comparable to DFT'),
+                'neutral': _metric(_neu),      # trustworthy
+                'charged': _metric(_chg),      # unreliable (reference/gauge)
+                'all': _metric(_hd),
+            }
+            for _k, _lab in [('neutral', 'NEUTRAL[trust]  '),
+                             ('charged', 'CHARGED[unreliable]')]:
+                _m = test_values['dipole_metrics'][_k]
+                if _m:
+                    line = (f"DIPOLE|mu| {_lab}: R2={_m['mag_R2']:<8.4f} "
+                            f"RMSE={_m['mag_RMSE_D']:<7.4f}D "
+                            f"slope={_m['mag_slope']:<7.4f} N={_m['N']}")
+                    print(line, file=self.fout)
+                    print(line)
         print(file=self.fout)
 
         torch.save(test_values, "test_values.pkl")
