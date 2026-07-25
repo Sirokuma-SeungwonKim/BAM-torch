@@ -84,3 +84,15 @@ _upload/
 bam_torch/legacy_phases/
 tests/*_output/
 docs/
+
+# Session data & deploy artifacts (2026-07-25)
+Aimnet2/
+_deploy/
+deploy/
+phase8/
+poc_s0q_baseline/
+memory_backups/
+*.tar.gz
+*.pid
+BCD.pid
+*.pdf
